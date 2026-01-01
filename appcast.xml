@@ -36,7 +36,33 @@
         =====================================================
         -->
 
-        <!-- LATEST VERSION: 1.0.83 (Build 50) -->
+        <!-- LATEST VERSION: 1.0.84 (Build 51) -->
+        <item>
+            <title>Version 1.0.84</title>
+            <pubDate>Wed, 01 Jan 2026 12:00:00 -0800</pubDate>
+            <description><![CDATA[
+                <h2>What's New in 1.0.84</h2>
+                <ul>
+                    <li><strong>Code Audit Fixes:</strong> Fixed potential crash in ChatViewModel with safe optional binding</li>
+                    <li><strong>Memory Leak Fixes:</strong> Resolved memory leaks in HotKeyManager and background processes</li>
+                    <li><strong>WebSocket Stability:</strong> Fixed connection state inconsistency in VoiceManager</li>
+                    <li><strong>macOS 14 Updates:</strong> Updated onChange modifiers to new API</li>
+                    <li><strong>UI Improvements:</strong> Added hand cursor on clickable buttons</li>
+                    <li>Universal binary (Apple Silicon + Intel)</li>
+                    <li>Apple notarized for enhanced security</li>
+                </ul>
+            ]]></description>
+            <enclosure
+                url="https://www.topoffunnel.com/downloads/Grok.dmg"
+                sparkle:version="51"
+                sparkle:shortVersionString="1.0.84"
+                sparkle:edSignature="fFX2Le0UDr9/qK3kj2vF+5qqrzOPbOe0fftCi92WgBBAe2fPDVvmLNDiF6Uku0RjOjhFqKl0v8zMa/KV/YFDDw=="
+                length="3850295"
+                type="application/octet-stream"
+            />
+            <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+        </item>
+        <!-- VERSION: 1.0.83 (Build 50) -->
         <item>
             <title>Version 1.0.83</title>
             <pubDate>Sun, 28 Dec 2025 09:53:43 -0800</pubDate>
