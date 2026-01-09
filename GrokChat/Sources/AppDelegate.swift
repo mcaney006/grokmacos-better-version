@@ -698,12 +698,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    // Navigation Methods - works for Chat, Grokipedia, X, and Chat.X
+    // Navigation Methods - works for Chat, Grokipedia, X, Chat.X, and Console
     private var activeWebView: WKWebView {
         switch currentMode {
         case .grokipedia: return grokipediaWebView
         case .xTwitter: return xWebView
         case .chatX: return chatXWebView
+        case .console: return consoleWebView
         default: return webView
         }
     }
@@ -818,6 +819,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Use SilentWebView to prevent keyboard beeps
         let wv = SilentWebView(frame: .zero, configuration: config)
+        wv.allowsBackForwardNavigationGestures = true
+        wv.allowsLinkPreview = true
+        wv.uiDelegate = self
+        wv.navigationDelegate = self
         if let url = URL(string: "https://console.x.ai/home") {
             wv.load(URLRequest(url: url))
         }
