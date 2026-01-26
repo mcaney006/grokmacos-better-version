@@ -47,3 +47,11 @@ __pycache__/
 create_dmg.py
 
 node_modules/
+appcast.xml
+release.sh
+release_repackage.sh
+deploy-notarized.sh
+RELEASE-WORKFLOW.md
+RELEASE_WORKFLOW_2025.md
+NOTARIZED-RELEASE-WORKFLOW.md
+DEVELOPMENT.md
