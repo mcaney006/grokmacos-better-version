@@ -1,57 +1,35 @@
-# Xcode
-#
-# gitignore contributors: remember to update Global/Xcode.gitignore, Objective-C.gitignore & Swift.gitignore
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
 
-## User settings
-xcuserdata/
+# IDE
+.vscode/
+.idea/
+*.iml
+.zed/
 
-## compatibility with Xcode 8 and earlier (ignoring not required starting Xcode 9)
-*.xcscmblueprint
-*.xccheckout
-
-## compatibility with Xcode 3 and earlier (ignoring not required starting Xcode 4)
-build/
-DerivedData/
-*.moved-aside
-*.pbxuser
-!default.pbxuser
-*.mode1v3
-!default.mode1v3
-*.mode2v3
-!default.mode2v3
-*.perspectivev3
-!default.perspectivev3
-
-## Gcc Patch
-/*.gcno
-
-## Swift Package Manager
-.build/
-.swiftpm/
-
-## macOS
+# OS
 .DS_Store
+Thumbs.db
 
-## Build artifacts
+# Runtime data
+*.log
+*.redb
+*.redb-lock
+/.grok-insane/
+
+# Build artefacts
 *.dmg
 *.app/
 *.zip
 *.pkg
+dist/
 
-## Claude/AI agent files
+# Local secrets (never commit)
+.env
+.env.local
+
+# AI agent files
 .agent/
-
-## Python
-*.pyc
-__pycache__/
-create_dmg.py
-
-node_modules/
-appcast.xml
-release.sh
-release_repackage.sh
-deploy-notarized.sh
-RELEASE-WORKFLOW.md
-RELEASE_WORKFLOW_2025.md
-NOTARIZED-RELEASE-WORKFLOW.md
-DEVELOPMENT.md
+.claude/cache/
