@@ -1,137 +1,102 @@
-# GrokChat - Native macOS Client for xAI Grok
+# GrokInsane
 
-A beautiful, native SwiftUI macOS application for interacting with xAI's Grok AI model.
+A cross-platform desktop client for xAI Grok, rewritten from the ground up in
+Rust + egui. Replaces the original SwiftUI macOS app with a single binary that
+runs on macOS, Windows, and Linux.
 
-## Features
+## Highlights
 
-- Native macOS app built with SwiftUI
-- Clean, modern chat interface
-- Multiple chat sessions with history
-- Real-time streaming responses
-- Secure API key storage
-- Customizable settings (model selection, temperature, font size)
-- Full keyboard shortcuts support
-- Dark mode support
+- **Native everywhere.** One Rust codebase, no Xcode, GPU-accelerated UI via
+  `eframe` + `wgpu`.
+- **Streaming chat.** OpenAI-compatible Server-Sent Events parser feeds the UI
+  token-by-token as Grok generates.
+- **Voice mode.** WebSocket client for `wss://api.x.ai/v1/realtime` plus a
+  cross-platform `cpal` audio engine for capture + playback, with a live
+  waveform widget and selectable personality (Ara / Rex / Sal / Eve / Leo).
+- **Embedded search.** Every message indexed by `tantivy`; full-text and
+  fuzzy lookups stay fast even at 100k+ messages.
+- **Embedded ACID store.** All chats, messages, and settings live in `redb`
+  next to the app, no external database needed.
+- **Secure secrets.** API keys stored in the OS keyring (Keychain / Credential
+  Manager / Secret Service).
+- **Optional local RAG.** Build with `--features rag` to add semantic
+  retrieval over your own chat history via `fastembed`.
+- **Performance dashboard.** Toggle from settings to see frame time, tokens/s,
+  request latency, and resident memory.
 
-## Requirements
+## Build & run
 
-- macOS 13.0 or later
-- xAI API key (get yours at [console.x.ai](https://console.x.ai))
-- Xcode 14.0+ (for building from source)
+Prerequisites:
 
-## Quick Start
-
-### Option 1: Run Pre-built App
-
-1. Open the pre-built app:
-   ```bash
-   cd GrokChat
-   open GrokChat.app
-   ```
-
-2. On first launch, go to Settings (⌘,) and add your xAI API key
-
-3. Start chatting with Grok!
-
-### Option 2: Build from Source
-
-1. Clone or download this repository
-
-2. Build and run:
-   ```bash
-   cd GrokChat
-   ./build.sh
-   open GrokChat.app
-   ```
-
-### Option 3: Development with Xcode
-
-1. Open Terminal and run:
-   ```bash
-   cd GrokChat
-   swift package generate-xcodeproj
-   open GrokChat.xcodeproj
-   ```
-
-2. Build and run in Xcode (⌘R)
-
-## Configuration
-
-### API Key Setup
-
-1. Get your API key from [console.x.ai](https://console.x.ai)
-2. Open GrokChat
-3. Go to Preferences (⌘,)
-4. Navigate to the API tab
-5. Enter your API key
-
-During the beta period, you get $25 of free API credits per month.
-
-### Available Models
-
-- `grok-beta` (default)
-- `grok-2` (coming soon)
-- `grok-2-mini` (coming soon)
-
-## Usage
-
-### Keyboard Shortcuts
-
-- **New Chat**: ⌘N
-- **Settings**: ⌘,
-- **Send Message**: Return
-- **Copy Message**: Right-click on any message
-
-### Features in Detail
-
-- **Chat History**: All conversations are saved locally
-- **Search**: Find previous conversations quickly
-- **Streaming**: See responses as they're generated
-- **Temperature Control**: Adjust response creativity (0.0 - 2.0)
-
-## Development
-
-### Project Structure
-
-```
-GrokChat/
-├── Sources/
-│   ├── Models/          # Data models
-│   ├── Views/           # SwiftUI views
-│   ├── ViewModels/      # View models
-│   ├── Services/        # API service
-│   └── GrokChatApp.swift
-├── Package.swift
-├── build.sh
-└── README.md
-```
-
-### Building for Distribution
-
-To create a release build:
+- Rust **1.78+** (`rustup install stable`)
+- Linux only: `libasound2-dev`, `libxkbcommon-dev`, `libwayland-dev`,
+  `libxcb*-dev`, `libfontconfig1-dev`
 
 ```bash
-swift build -c release
+# debug build
+cargo run
+
+# release build
+cargo build --release
+./target/release/grok-insane
 ```
 
-The executable will be in `.build/release/GrokChat`
+Optional feature flags:
 
-## Troubleshooting
+```bash
+cargo run --features rag            # local semantic retrieval (downloads model)
+cargo run --features hotkeys        # global system hotkeys
+cargo run --features plugins        # WebAssembly plugin host (experimental)
+```
 
-### API Key Issues
-- Ensure your API key is valid and has available credits
-- Check your internet connection
-- Verify the API endpoint is accessible
+## First-time setup
 
-### Build Issues
-- Ensure you have Xcode Command Line Tools installed
-- Run `xcode-select --install` if needed
-- Make sure you're on macOS 13.0 or later
+1. Launch the app.
+2. Press <kbd>⌘ / Ctrl</kbd>+<kbd>,</kbd> to open Settings.
+3. Choose a provider (default: xAI), paste your API key, click **Save key**.
+4. Start chatting. <kbd>⌘ / Ctrl</kbd>+<kbd>N</kbd> for a new chat.
+
+## Keyboard shortcuts
+
+| Shortcut | Action |
+|---|---|
+| <kbd>⌘ / Ctrl</kbd>+<kbd>N</kbd> | New chat |
+| <kbd>⌘ / Ctrl</kbd>+<kbd>,</kbd> | Toggle settings |
+| <kbd>⌘ / Ctrl</kbd>+<kbd>.</kbd> | Stop generation |
+| <kbd>⌘ / Ctrl</kbd>+<kbd>⇧</kbd>+<kbd>V</kbd> | Toggle voice mode |
+| <kbd>Enter</kbd> | Send |
+| <kbd>⇧</kbd>+<kbd>Enter</kbd> | Newline |
+
+## Repository layout
+
+```
+src/
+├── main.rs            entry point + tracing setup
+├── app.rs             top-level eframe::App
+├── config.rs          live settings handle
+├── paths.rs           OS-specific app directories
+├── secrets.rs         keyring wrapper
+├── theme.rs           custom egui theme
+├── error.rs           strongly-typed error enums
+├── models.rs          Chat, Message, Settings, …
+├── storage/
+│   ├── mod.rs         redb façade
+│   └── search.rs      tantivy index
+├── services/
+│   ├── chat.rs        xAI streaming client
+│   ├── voice.rs       realtime WS client
+│   ├── audio.rs       cpal capture + playback
+│   ├── providers.rs   ChatProvider trait
+│   └── embeddings.rs  optional RAG
+└── ui/
+    ├── chat_view.rs   transcript + composer
+    ├── sidebar.rs     chat list
+    ├── settings_view.rs
+    ├── perf_dashboard.rs
+    ├── waveform.rs    custom widget
+    └── toast.rs       toast queue
+```
 
 ## License
 
-This project is provided as-is for educational and personal use.
-
-## Acknowledgments
-
-Built with SwiftUI and the xAI Grok API.
+Dual licensed under MIT or Apache-2.0.
