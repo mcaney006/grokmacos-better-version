@@ -1,0 +1,12 @@
+# Disable the free-form "Open a blank issue" link so every report goes
+# through one of the structured forms below. This is what makes triage
+# tractable.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Verification questions
+    url: https://github.com/mcaney006/grokmacos-better-version#verifying-a-release
+    about: Need help verifying a release signature, SBOM, or SLSA attestation? Start here.
+  - name: Security report
+    url: https://github.com/mcaney006/grokmacos-better-version/security/advisories/new
+    about: Privately disclose a security vulnerability via GitHub Security Advisories. Do not file a public issue.

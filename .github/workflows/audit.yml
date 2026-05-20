@@ -25,13 +25,14 @@ concurrency:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-permissions:
-  contents: read
+permissions: read-all
 
 jobs:
   cargo-deny:
     name: cargo-deny (advisories + licenses + bans + sources)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
       - uses: EmbarkStudios/cargo-deny-action@08f29ebbc9295095546acaf37220058f628a4720  # v2
@@ -42,6 +43,8 @@ jobs:
   cargo-audit:
     name: cargo-audit (RustSec advisories)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
@@ -63,3 +66,25 @@ jobs:
             --ignore RUSTSEC-2025-0141 \
             --ignore RUSTSEC-2025-0119 \
             --ignore RUSTSEC-2024-0436
+
+  unused-deps:
+    name: unused-deps (cargo-machete)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: "1.94.0"
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          shared-key: machete
+      - name: Install cargo-machete
+        run: cargo install --locked cargo-machete
+      - name: Detect unused dependencies
+        # Machete is a strictly text-based scanner: zero compile time, near-
+        # zero false positives, big wins for keeping the dep graph honest.
+        # If an unused dep is intentional (only used behind a cfg gate), add
+        # a `package.metadata.cargo-machete.ignored = [...]` entry.
+        run: cargo machete

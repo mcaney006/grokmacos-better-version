@@ -1,0 +1,58 @@
+name: Performance regression
+description: A slowdown, memory spike, frame-time spike, or other perf issue.
+title: "[perf]: "
+labels: ["performance", "needs-triage"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What got slower or heavier?
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit where the regression appeared
+      placeholder: "v0.1.0 or commit SHA"
+    validations:
+      required: true
+
+  - type: input
+    id: last-good
+    attributes:
+      label: Last known good version (if any)
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Command, sequence, or scenario to trigger the slow path.
+      render: bash
+    validations:
+      required: true
+
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Numbers
+      description: |
+        Frame time, fps, tokens/sec, memory, latency — whatever you can
+        measure. Screenshots of the in-app perf dashboard are great.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Area
+      options:
+        - UI rendering
+        - Chat streaming
+        - Voice / audio
+        - Storage / search
+        - Startup
+        - Build / link time
+        - Other
+    validations:
+      required: true

@@ -1,0 +1,43 @@
+# GitHub's auto-generated release-notes formatter. When you create a Release
+# from a tag, the PRs merged since the previous tag get grouped by label
+# into the categories below. Keep PR labels narrow so the grouping stays
+# meaningful.
+
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+      - internal
+      - dependencies-dev
+  categories:
+    - title: ⚠️ Breaking changes
+      labels:
+        - breaking
+    - title: ✨ Features
+      labels:
+        - feature
+        - enhancement
+    - title: 🐛 Fixes
+      labels:
+        - bug
+        - fix
+    - title: ⚡ Performance
+      labels:
+        - performance
+        - perf
+    - title: 🔒 Security
+      labels:
+        - security
+    - title: 📚 Documentation
+      labels:
+        - documentation
+        - docs
+    - title: 🧰 Maintenance
+      labels:
+        - deps
+        - ci
+        - refactor
+        - chore
+    - title: Other changes
+      labels:
+        - "*"

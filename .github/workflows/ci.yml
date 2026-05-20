@@ -4,6 +4,11 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # `merge_group` lets GitHub's merge queue run CI on the synthetic merge
+  # commit (PR + main combined) before actually landing the PR. That is the
+  # difference between "this PR was green in isolation" and "main stays green
+  # after this PR lands alongside whatever else just merged."
+  merge_group:
 
 # Cancel in-flight runs for the same ref when a new commit lands.
 concurrency:
@@ -18,9 +23,16 @@ env:
   # belt-and-braces against any transitive JS action picking up Node 20.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# Workflow-wide token floor is read-only. Any job that needs more privilege
+# (e.g. writing artifact attestations) must explicitly elevate. This is the
+# GitHub-recommended "least privilege" posture for GITHUB_TOKEN.
+permissions: read-all
+
 jobs:
   build:
     name: ${{ matrix.label }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -45,14 +57,9 @@ jobs:
           toolchain: "1.94.0"
           components: rustfmt, clippy
 
-      # Rust-specific caching. Replaces actions/cache@v4 which targets Node
-      # 20 and emits a deprecation warning when force-flipped to Node 24.
-      # Swatinem/rust-cache@v2 understands `target/`, the cargo registry, and
-      # git checkout caches as one unit and is Node 24 native.
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           shared-key: ci-${{ runner.os }}-${{ runner.arch }}
-          # Don't poison the cache if any step fails.
           cache-on-failure: false
 
       - name: Toolchain info
@@ -77,6 +84,25 @@ jobs:
 
       - name: Release build
         run: cargo xtask dist
+
+      # Render a compact, copy-pasteable summary into the run page so
+      # reviewers don't have to scroll through 9 000 lines of ANSI.
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## $(echo '${{ matrix.label }}')"
+            echo ""
+            echo "| Step | Result |"
+            echo "| --- | --- |"
+            echo "| Fmt check | ${{ steps.fmt-check.outcome || 'completed' }} |"
+            echo "| Clippy | ${{ steps.clippy.outcome || 'completed' }} |"
+            echo "| Test | ${{ steps.test.outcome || 'completed' }} |"
+            echo "| Release build | ${{ steps.release-build.outcome || 'completed' }} |"
+            echo ""
+            echo "rustc: \`$(rustc --version | head -1)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

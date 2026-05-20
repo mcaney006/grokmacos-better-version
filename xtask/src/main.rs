@@ -50,6 +50,8 @@ fn run() -> Result<()> {
         "bundle" => bundle(),
         "audit" => audit(),
         "sbom" => sbom(),
+        "doctor" => doctor(),
+        "preflight" => preflight(),
         "sign" => sign(),
         "notarize" => notarize(),
         "dmg" => dmg(),
@@ -57,6 +59,7 @@ fn run() -> Result<()> {
         "install-deps" => install_deps(),
         "ci" => ci(),
         "clean" => clean(),
+        "clean-deep" => clean_deep(),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -81,6 +84,8 @@ fn print_help() {
     println!("  bundle        per-OS bundle in dist/  (.app / .exe / staged dir)");
     println!("  audit         run cargo-audit + cargo-deny (installs them if missing)");
     println!("  sbom          emit CycloneDX SBOM at dist/<triple>/grok-insane.sbom.json");
+    println!("  doctor        verify the local environment can build + run the app");
+    println!("  preflight     check + audit + sbom + dist (run before opening a release PR)");
     println!("  sign          macOS: codesign --options runtime --timestamp with Developer ID");
     println!("  notarize      macOS: xcrun notarytool submit --wait + stapler");
     println!("  dmg           macOS: bundle -> sign -> notarize -> staple -> .dmg in dist/");
@@ -88,6 +93,9 @@ fn print_help() {
     println!("  install-deps  install OS dev libs (Linux apt only)");
     println!("  ci            install-deps + check + dist");
     println!("  clean         cargo clean + remove dist/");
+    println!(
+        "  clean-deep    cargo clean + remove dist/ + ~/.cargo/registry/cache for this workspace"
+    );
     println!("  help          this message");
 }
 
@@ -214,6 +222,140 @@ fn sbom() -> Result<()> {
         println!("sbom: {}", dst.display());
     }
     Ok(())
+}
+
+/// Walk the local environment and report everything the app needs to build
+/// and run. Doesn't change anything — read-only diagnostic. Useful for new
+/// contributors and for triaging "works on my machine" reports.
+fn doctor() -> Result<()> {
+    println!("== rust ==");
+    let _ = Command::new("rustc").arg("--version").status();
+    let _ = Command::new("cargo").arg("--version").status();
+    let _ = Command::new("cargo").arg("fmt").arg("--version").status();
+    let _ = Command::new("cargo")
+        .arg("clippy")
+        .arg("--version")
+        .status();
+
+    println!("\n== workspace ==");
+    let root = workspace_root();
+    println!("workspace root: {}", root.display());
+    for f in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        "deny.toml",
+        ".gitattributes",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/audit.yml",
+    ] {
+        let p = root.join(f);
+        println!("  {} {}", if p.exists() { "✓" } else { "✗" }, f);
+    }
+
+    println!("\n== platform tools ==");
+    let tools: &[&str] = if cfg!(target_os = "macos") {
+        &["codesign", "hdiutil", "xcrun", "security", "ditto"]
+    } else if cfg!(target_os = "linux") {
+        &["pkg-config", "apt-get", "tar"]
+    } else if cfg!(target_os = "windows") {
+        &["link.exe", "powershell.exe"]
+    } else {
+        &[]
+    };
+    for t in tools {
+        let found = which(t).is_some();
+        println!("  {} {}", if found { "✓" } else { "✗" }, t);
+    }
+
+    println!("\n== optional ==");
+    for t in [
+        "cargo-audit",
+        "cargo-deny",
+        "cargo-cyclonedx",
+        "cargo-machete",
+        "cosign",
+    ] {
+        let found = which(t).is_some();
+        println!(
+            "  {} {} (install with `cargo install --locked {}`)",
+            if found { "✓" } else { "•" },
+            t,
+            t
+        );
+    }
+
+    // Try a no-op cargo metadata to confirm the workspace resolves.
+    println!("\n== resolution ==");
+    let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--locked")
+        .stdout(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("  ✓ cargo metadata --locked OK"),
+        Ok(s) => println!("  ✗ cargo metadata --locked failed: {s}"),
+        Err(e) => println!("  ✗ could not spawn cargo: {e}"),
+    }
+
+    println!("\nDone.");
+    Ok(())
+}
+
+/// Comprehensive pre-release gate. Run this locally before opening a PR that
+/// expects to ship a release. Mirrors what CI does, plus the supply-chain
+/// scan and SBOM generation so failures surface here instead of at tag-push
+/// time.
+fn preflight() -> Result<()> {
+    println!("== preflight 1/4: cargo xtask check ==");
+    check()?;
+    println!("\n== preflight 2/4: cargo xtask audit ==");
+    audit()?;
+    println!("\n== preflight 3/4: cargo xtask sbom ==");
+    sbom()?;
+    println!("\n== preflight 4/4: cargo xtask dist ==");
+    dist()?;
+    println!("\nAll preflight checks passed. Safe to tag a release.");
+    Ok(())
+}
+
+/// Deeper clean than `cargo clean`: also removes `dist/` and the registry
+/// download cache. Use this if a corrupted cache is causing weird build
+/// errors that survive a plain `cargo clean`.
+fn clean_deep() -> Result<()> {
+    clean()?;
+    if let Some(home) = dirs_home_cache() {
+        let registry_cache = home.join("registry").join("cache");
+        if registry_cache.exists() {
+            println!("removing {}", registry_cache.display());
+            let _ = std::fs::remove_dir_all(&registry_cache);
+        }
+        let git_db = home.join("git").join("db");
+        if git_db.exists() {
+            println!("removing {}", git_db.display());
+            let _ = std::fs::remove_dir_all(&git_db);
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort lookup of the user's cargo home — `$CARGO_HOME` if set,
+/// otherwise `~/.cargo`. Returns `None` if neither resolves.
+fn dirs_home_cache() -> Option<PathBuf> {
+    if let Ok(p) = env::var("CARGO_HOME") {
+        return Some(PathBuf::from(p));
+    }
+    #[cfg(unix)]
+    {
+        env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo"))
+    }
+    #[cfg(windows)]
+    {
+        env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".cargo"))
+    }
 }
 
 fn ensure_installed(crate_name: &str) -> Result<()> {

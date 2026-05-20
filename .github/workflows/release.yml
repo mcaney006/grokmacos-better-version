@@ -31,17 +31,25 @@ env:
   RUST_BACKTRACE: short
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# `id-token: write` is what enables Sigstore keyless signing — the OIDC
-# token from this workflow is what cosign exchanges for a short-lived signing
-# cert from Fulcio.
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
+# Workflow-wide floor is read-only. Each job below opts in to the precise
+# extra scopes it needs (id-token + attestations for signing, contents:write
+# for the final Release publish). Belt and braces against accidental
+# privilege inheritance.
+permissions: read-all
 
 jobs:
   build:
     name: build ${{ matrix.label }}
+    permissions:
+      contents: read
+      id-token: write       # OIDC token for Sigstore keyless signing
+      attestations: write   # actions/attest-build-provenance writes here
+    # The `release` environment gates this job behind whatever review you
+    # configure on the GitHub side (required reviewers, wait timer, allowed
+    # branches/tags). Release signing should not happen because a workflow
+    # sneezed; it should happen because a maintainer approved it.
+    environment:
+      name: release
     strategy:
       fail-fast: false
       matrix:
@@ -68,6 +76,21 @@ jobs:
       - name: Install Linux deps
         if: matrix.os == 'ubuntu-latest'
         run: cargo xtask install-deps
+
+      # Pin SOURCE_DATE_EPOCH to the commit's authored timestamp. Build
+      # toolchains and packaging steps that honour this variable will embed
+      # the commit time instead of "now", so two CI runs of the same tag
+      # produce identical artifacts (modulo unavoidable platform differences
+      # like the macOS code-signature blob). This is the "reproducibility
+      # proof" half of the reproducible-builds story; the other half is the
+      # rust-toolchain.toml + Cargo.lock + --locked combo.
+      - name: Compute SOURCE_DATE_EPOCH
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDE="$(git log -1 --pretty=%ct)"
+          echo "SOURCE_DATE_EPOCH=$SDE" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH set to $SDE ($(date -u -d @$SDE 2>/dev/null || true))"
 
       # --- macOS: import codesigning cert into an ephemeral keychain --------
       - name: Set up macOS keychain

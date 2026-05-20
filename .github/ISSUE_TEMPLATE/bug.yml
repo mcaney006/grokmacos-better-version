@@ -1,0 +1,81 @@
+name: Bug report
+description: Something doesn't work the way it should.
+title: "[bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in the fields
+        below — they're the bare minimum for someone to reproduce the issue.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What were you doing, and what went wrong?
+      placeholder: |
+        e.g. "Pressing ⌘K opens the palette, but Enter no longer runs the
+        selected action."
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      placeholder: "v0.1.0, or `grok-insane --version`, or a commit SHA"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (arm64)
+        - macOS (x86_64)
+        - Linux (x86_64)
+        - Windows (x86_64)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Exact steps. The fewer the better.
+      placeholder: |
+        1. Launch the app
+        2. Open settings
+        3. Click "Save key"
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: |
+        Include the diagnostic output of `grok-insane --diag` and any
+        relevant lines from `~/.cache/grok-insane/logs/`.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Screenshots, links, anything else.
+    validations:
+      required: false
