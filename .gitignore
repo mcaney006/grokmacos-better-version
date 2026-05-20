@@ -25,6 +25,8 @@ Thumbs.db
 *.zip
 *.pkg
 dist/
+# xtask telemetry (one JSON object per command run; tail for CI trends)
+**/xtask-metrics.jsonl
 
 # Local secrets (never commit)
 .env

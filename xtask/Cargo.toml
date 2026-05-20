@@ -13,3 +13,19 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# Cross-platform PATH lookup. The std-only loop we used to ship missed
+# Windows `.exe`/`.cmd`/`.bat` and ignored `PATHEXT`. `which` handles all of
+# that for us.
+which = "8"
+# Hashing release artifacts for the SHA256SUMS file we publish alongside
+# every binary so downstream verifiers can confirm integrity without
+# round-tripping through Sigstore.
+sha2 = "0.10"
+# Serialising the xtask telemetry JSONL stream.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+# build.rs records the rustc target triple at compile time so we don't have
+# to fork `rustc -vV` every invocation.
+# (none — only std needed)
