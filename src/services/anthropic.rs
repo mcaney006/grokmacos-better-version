@@ -528,6 +528,55 @@ mod tests {
     /// arbitrary-sized chunks and assert that `feed` + `eof` + `next_event`
     /// always return cleanly.
     ///
+    /// Fixture-driven invariance check: replay a captured Anthropic SSE
+    /// stream at every chunk size from 1 to 128 bytes; the emitted event
+    /// stream must be identical across all chunkings. Catches subtle
+    /// boundary bugs that only fire under specific chunk sizes (e.g. one
+    /// byte short of a CRLF, or `\n` arriving alone).
+    #[test]
+    fn anthropic_decoder_fixture_replay_chunk_sizes_1_through_128() {
+        let fixture: &[u8] = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\r\n\r\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"world \"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\u{1F600}\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":9}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        )
+        .as_bytes();
+
+        let mut canonical: Option<Vec<String>> = None;
+        for chunk_size in 1..=128usize {
+            let mut d = AnthropicDecoder::new(None);
+            let mut i = 0;
+            while i < fixture.len() {
+                let end = (i + chunk_size).min(fixture.len());
+                d.feed(&fixture[i..end]);
+                i = end;
+            }
+            let events: Vec<String> = collect(&mut d)
+                .into_iter()
+                .filter_map(Result::ok)
+                .map(|e| format!("{e:?}"))
+                .collect();
+            match &canonical {
+                None => canonical = Some(events),
+                Some(c) => assert_eq!(
+                    c, &events,
+                    "fixture replay diverged at chunk_size={chunk_size}"
+                ),
+            }
+        }
+        let canonical = canonical.expect("ran at least once");
+        let joined: String = canonical.join(",");
+        assert!(joined.contains("hello "), "{joined}");
+        assert!(joined.contains("world "), "{joined}");
+        assert!(joined.contains("\u{1F600}"), "{joined}");
+        assert!(joined.contains("Done"), "{joined}");
+    }
+
     /// Uses a simple LCG so this stays a unit test (no extra dep) and
     /// rotates through 1000 deterministic seeds — equivalent in coverage
     /// to a small proptest run.

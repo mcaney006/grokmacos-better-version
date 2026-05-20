@@ -588,6 +588,51 @@ mod tests {
         assert_eq!(deltas.concat(), "alphabeta");
     }
 
+    /// Fixture-driven invariance check: a single golden SSE byte-buffer
+    /// replayed at chunk sizes 1..=128 must produce identical event
+    /// streams. Catches off-by-one bugs in the line buffer that only
+    /// surface under specific chunk boundaries (e.g. one byte short of a
+    /// `\n`, or the `\n` arriving alone in its own chunk).
+    #[test]
+    fn sse_decoder_fixture_replay_chunk_sizes_1_through_128() {
+        // Realistic xAI-shaped SSE: 3 deltas (one with multi-byte UTF-8),
+        // one usage event, terminator. CRLF + LF mixed to stress both.
+        let fixture: &[u8] = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"world \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{1F600}\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}], \"usage\":{\"prompt_tokens\":4,\"completion_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        ).as_bytes();
+
+        let mut canonical: Option<Vec<String>> = None;
+        for chunk_size in 1..=128usize {
+            let mut d = SseDecoder::new(None);
+            let mut i = 0;
+            while i < fixture.len() {
+                let end = (i + chunk_size).min(fixture.len());
+                d.feed(&fixture[i..end]);
+                i = end;
+            }
+            let events: Vec<String> = collect_ok(&mut d)
+                .into_iter()
+                .map(|e| format!("{e:?}"))
+                .collect();
+            match &canonical {
+                None => canonical = Some(events),
+                Some(c) => assert_eq!(
+                    c, &events,
+                    "fixture replay diverged at chunk_size={chunk_size}"
+                ),
+            }
+        }
+        let canonical = canonical.expect("ran at least once");
+        assert!(canonical.iter().any(|s| s.contains("hello ")));
+        assert!(canonical.iter().any(|s| s.contains("world ")));
+        assert!(canonical.iter().any(|s| s.contains("\u{1F600}")));
+        assert!(canonical.iter().any(|s| s.contains("Done")));
+    }
+
     /// Regression: persistent JSON parse failures surface as a
     /// `ProviderStream` error after `SSE_PARSE_FAILURE_LIMIT` strikes
     /// instead of silently swallowing forever.
