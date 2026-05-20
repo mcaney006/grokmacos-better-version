@@ -63,4 +63,4 @@ jobs:
       - name: Install zizmor
         run: pipx install zizmor
       - name: Run zizmor
-        run: zizmor --pedantic --persona=auditor .github/workflows/
+        run: zizmor --pedantic .github/workflows/
