@@ -1,11 +1,16 @@
-#![allow(dead_code)]
 //! Strongly-typed errors used throughout the application.
 //!
 //! Surface-area rules:
-//! * Anything that escapes a thread/task boundary is converted into one of the
-//!   `*Error` enums below so callers never see a raw `anyhow::Error` upstream.
-//! * UI code shows the `Display` impl directly — keep messages short, lowercase,
-//!   imperative.
+//! * Anything that escapes a thread/task boundary is converted into one of
+//!   the `*Error` enums below so callers never see a raw `anyhow::Error`
+//!   upstream.
+//! * UI code shows the `Display` impl directly — keep messages short,
+//!   lowercase, imperative.
+//!
+//! Variants are added when a call site actually constructs them, not
+//! before. Dead variants used to live here on the theory "we might need
+//! `Cancelled` / `NotFound` / `Resample` someday"; they were just text
+//! attached to a derive macro that confused readers. Gone.
 
 use thiserror::Error;
 
@@ -27,14 +32,9 @@ pub enum StorageError {
     Decode(String),
     #[error("search index error: {0}")]
     Index(String),
-    #[error("not found: {0}")]
-    NotFound(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
-
-// bincode 2 no longer exposes a single `Error` alias; we use string-typed
-// `StorageError::Encode`/`Decode` directly at the call site instead.
 
 impl From<tantivy::TantivyError> for StorageError {
     fn from(value: tantivy::TantivyError) -> Self {
@@ -58,10 +58,6 @@ pub enum ApiError {
     WebSocket(String),
     #[error("server returned {status}: {body}")]
     BadStatus { status: u16, body: String },
-    #[error("decoding stream: {0}")]
-    StreamDecode(String),
-    #[error("request was cancelled")]
-    Cancelled,
     #[error("invalid response: {0}")]
     InvalidResponse(String),
 }
@@ -72,16 +68,12 @@ pub enum AudioError {
     NoInput,
     #[error("no output device available")]
     NoOutput,
-    #[error("device error: {0}")]
-    Device(String),
     #[error("supported config error: {0}")]
     Config(String),
     #[error("build stream error: {0}")]
     BuildStream(String),
     #[error("play error: {0}")]
     Play(String),
-    #[error("resample error: {0}")]
-    Resample(String),
 }
 
 #[derive(Debug, Error)]

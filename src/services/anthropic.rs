@@ -7,7 +7,7 @@
 
 use crate::error::ApiError;
 use crate::models::{Provider, WireMessage};
-use crate::services::chat::http_client;
+use crate::services::chat::{http_client, HttpPolicy};
 use crate::services::providers::{ChatEvent, ChatProvider, ChatRequest, EventStream};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -28,7 +28,7 @@ pub struct AnthropicClient {
 impl AnthropicClient {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            http: http_client(),
+            http: http_client(HttpPolicy::STRICT),
             base: DEFAULT_BASE.to_string(),
             api_key: Zeroizing::new(api_key.into()),
         }

@@ -217,10 +217,18 @@ impl GrokApp {
             .unwrap_or_else(|| provider_model(&s, s.default_provider).to_string());
 
         let messages: Vec<WireMessage> = self.messages.iter().map(WireMessage::from).collect();
-        let messages = if s.rag_enabled {
-            self.augment_with_rag(messages, &body)
+        // RAG augmentation was previously a synchronous call here on the UI
+        // thread. With `--features rag` that's hundreds of milliseconds of
+        // ONNX inference; eframe stalls for the duration. Now we capture
+        // the inputs and run augmentation inside the spawned tokio task
+        // (via spawn_blocking, since fastembed isn't async-aware).
+        let rag_enabled = s.rag_enabled;
+        let rag_top_k = s.rag_top_k.max(1) as usize;
+        let rag_query = body.clone();
+        let store_for_rag = if rag_enabled {
+            Some(self.store.clone())
         } else {
-            messages
+            None
         };
 
         let api_key = match secrets::get_api_key(&provider) {
@@ -258,13 +266,9 @@ impl GrokApp {
         self.stream_input_tokens = 0;
         self.stream_output_tokens = 0;
 
-        let request = ChatRequest {
-            model: model.clone(),
-            messages,
-            temperature: s.temperature,
-            max_tokens: Some(s.max_tokens),
-            system_prompt: s.system_prompt.clone(),
-        };
+        let temperature = s.temperature;
+        let max_tokens = s.max_tokens;
+        let system_prompt = s.system_prompt.clone();
         let provider_id = match provider.as_str() {
             "xai" => Provider::Xai,
             "openai" => Provider::OpenAi,
@@ -273,6 +277,35 @@ impl GrokApp {
         };
 
         self.runtime.spawn(async move {
+            // RAG augmentation runs here (off the UI thread). We use
+            // spawn_blocking because fastembed::TextEmbedding is sync and
+            // CPU-heavy; we want it on a dedicated worker, not stalling
+            // a tokio I/O thread.
+            let messages = if let Some(store) = store_for_rag {
+                let q = rag_query.clone();
+                match tokio::task::spawn_blocking(move || {
+                    augment_with_rag_blocking(store, messages, &q, rag_top_k)
+                })
+                .await
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "rag worker panicked; sending without context");
+                        Vec::new() // fall through with empty so request still goes
+                    }
+                }
+            } else {
+                messages
+            };
+
+            let request = ChatRequest {
+                model: model.clone(),
+                messages,
+                temperature,
+                max_tokens: Some(max_tokens),
+                system_prompt,
+            };
+
             let result = run_completion(
                 provider_id,
                 api_key,
@@ -288,28 +321,8 @@ impl GrokApp {
         });
     }
 
-    fn augment_with_rag(&self, mut messages: Vec<WireMessage>, query: &str) -> Vec<WireMessage> {
-        let retriever = Retriever::new(self.store.clone());
-        let s = self.settings.get();
-        let hits = retriever
-            .retrieve(query, s.rag_top_k.max(1) as usize)
-            .unwrap_or_default();
-        if hits.is_empty() {
-            return messages;
-        }
-        let mut context = String::from("Relevant prior context:\n");
-        for h in hits {
-            context.push_str(&format!("- {}\n", h.snippet.replace('\n', " ")));
-        }
-        messages.insert(
-            0,
-            WireMessage {
-                role: "system".into(),
-                content: context,
-            },
-        );
-        messages
-    }
+    // RAG used to live as a method here; it now runs off the UI thread via
+    // `augment_with_rag_blocking` (free function below).
 
     fn cancel_stream(&mut self) {
         self.cancel_flag.store(true, Ordering::SeqCst);
@@ -837,6 +850,35 @@ impl GrokApp {
             self.last_mem_refresh = now;
         }
     }
+}
+
+/// Synchronous RAG augmentation, designed to run inside
+/// `tokio::task::spawn_blocking`. Builds a "Relevant prior context"
+/// system message from the top-k tantivy hits (and, with `--features rag`,
+/// semantic re-ranking via fastembed) and prepends it to `messages`.
+fn augment_with_rag_blocking(
+    store: crate::storage::Store,
+    mut messages: Vec<WireMessage>,
+    query: &str,
+    top_k: usize,
+) -> Vec<WireMessage> {
+    let retriever = Retriever::new(store);
+    let hits = retriever.retrieve(query, top_k).unwrap_or_default();
+    if hits.is_empty() {
+        return messages;
+    }
+    let mut context = String::from("Relevant prior context:\n");
+    for h in hits {
+        context.push_str(&format!("- {}\n", h.snippet.replace('\n', " ")));
+    }
+    messages.insert(
+        0,
+        WireMessage {
+            role: "system".into(),
+            content: context,
+        },
+    );
+    messages
 }
 
 fn provider_model(s: &Settings, p: Provider) -> &str {

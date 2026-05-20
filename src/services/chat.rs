@@ -13,21 +13,44 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
-/// Shared HTTP client with hardened defaults:
-/// * TLS 1.2+ enforced (TLS 1.0/1.1 are deprecated and have known weaknesses).
-/// * `https_only(true)` blocks accidental plain-HTTP downgrades.
+/// HTTP client policy. Lets each provider relax exactly the constraint it
+/// needs. We default to the strictest setting and explicit opt-outs are
+/// required at the call site — there's no "permissive default" anywhere.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpPolicy {
+    /// Refuse plain `http://` URLs. The remote providers (xAI / OpenAI /
+    /// Anthropic) are HTTPS-only and we want a hard failure on anyone
+    /// trying to downgrade. The local provider talks to
+    /// `http://127.0.0.1` by default and explicitly relaxes this.
+    pub https_only: bool,
+}
+
+impl HttpPolicy {
+    /// Strictest stance: HTTPS-only, TLS 1.2+. Used by every cloud
+    /// provider client.
+    pub const STRICT: Self = HttpPolicy { https_only: true };
+    /// Loopback-friendly: still TLS 1.2+ if HTTPS is used, but plain HTTP
+    /// is also accepted. The only legitimate use is the LocalClient
+    /// talking to Ollama / LM Studio / llama.cpp-server on 127.0.0.1.
+    pub const LOOPBACK: Self = HttpPolicy { https_only: false };
+}
+
+/// Build a hardened HTTP client tuned by `policy`:
+/// * TLS 1.2+ enforced (TLS 1.0/1.1 are deprecated and have known
+///   weaknesses) regardless of policy.
+/// * `https_only` per the policy. Most providers want it true.
 /// * Tight `connect_timeout` so DNS or TCP stalls fail fast instead of
 ///   keeping a half-open socket around.
 /// * Overall `timeout` caps any single request — guards against a malicious
 ///   or buggy server holding the stream open forever.
-pub fn http_client() -> Client {
+pub fn http_client(policy: HttpPolicy) -> Client {
     #[allow(clippy::expect_used)] // Builder failure is a process-wide misconfig at startup
     Client::builder()
         .user_agent(concat!("grok-insane/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(120))
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(Some(Duration::from_secs(60)))
-        .https_only(true)
+        .https_only(policy.https_only)
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .build()
         .expect("reqwest client")
@@ -58,8 +81,19 @@ impl XaiClient {
     }
 
     pub fn with_base(api_key: impl Into<String>, base: impl Into<String>) -> Self {
+        Self::with_base_and_policy(api_key, base, HttpPolicy::STRICT)
+    }
+
+    /// Lower-level constructor that lets a non-cloud caller (notably
+    /// LocalClient) relax the HTTPS-only constraint without weakening
+    /// the cloud-facing defaults.
+    pub fn with_base_and_policy(
+        api_key: impl Into<String>,
+        base: impl Into<String>,
+        policy: HttpPolicy,
+    ) -> Self {
         Self {
-            http: http_client(),
+            http: http_client(policy),
             base: base.into(),
             api_key: Zeroizing::new(api_key.into()),
         }

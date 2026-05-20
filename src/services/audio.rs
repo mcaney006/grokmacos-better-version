@@ -27,6 +27,15 @@ use std::sync::Arc;
 
 pub const VOICE_SAMPLE_RATE: u32 = 24_000;
 
+/// Depth of the cpal-callback → bridge-thread capture queue. At
+/// VOICE_SAMPLE_RATE × 2 bytes/sample × mono, 32 frames is about
+/// 0.7 s of audio worst-case — generous slack against jitter, small
+/// enough that we never queue stale audio nor pin RAM. The cpal
+/// callback uses `try_send`: when this fills up (because the WS sink
+/// stalled), we drop the newest frame on the audio thread. Real-time
+/// audio prefers stale-data-loss over latency growth.
+pub const CAPTURE_QUEUE_DEPTH: usize = 32;
+
 /// Shared, `Send + Sync` view of an active voice audio engine. Cheap to clone.
 #[derive(Clone)]
 pub struct VoiceShared {
@@ -70,7 +79,10 @@ impl VoiceAudio {
         let level_out = LevelMeter::default();
         let speaking = Arc::new(AtomicBool::new(false));
 
-        let (capture_tx, capture_rx) = crossbeam_channel::unbounded::<Vec<i16>>();
+        // Bounded so a stalled WS sink can't grow RAM forever. See
+        // CAPTURE_QUEUE_DEPTH; the input stream uses `try_send` and drops
+        // on full.
+        let (capture_tx, capture_rx) = crossbeam_channel::bounded::<Vec<i16>>(CAPTURE_QUEUE_DEPTH);
         let (playback_tx, playback_rx) = crossbeam_channel::unbounded::<Vec<i16>>();
 
         let input = build_input_stream(&input_dev, capture_tx, level_in.clone())?;
@@ -149,7 +161,11 @@ fn build_input_stream(
                     mono
                 };
                 let pcm: Vec<i16> = mono.iter().map(|s| f32_to_i16(*s)).collect();
-                let _ = out_tx.send(pcm);
+                // `try_send` instead of `send`: if the consumer is behind
+                // we drop the frame rather than block the cpal callback
+                // thread (real-time audio principle: stale audio helps
+                // nobody; latency growth is the worse failure mode).
+                let _ = out_tx.try_send(pcm);
             },
             err_fn,
             None,
@@ -166,7 +182,11 @@ fn build_input_stream(
                     mono
                 };
                 let pcm: Vec<i16> = mono.iter().map(|s| f32_to_i16(*s)).collect();
-                let _ = out_tx.send(pcm);
+                // `try_send` instead of `send`: if the consumer is behind
+                // we drop the frame rather than block the cpal callback
+                // thread (real-time audio principle: stale audio helps
+                // nobody; latency growth is the worse failure mode).
+                let _ = out_tx.try_send(pcm);
             },
             err_fn,
             None,
@@ -183,7 +203,11 @@ fn build_input_stream(
                     mono
                 };
                 let pcm: Vec<i16> = mono.iter().map(|s| f32_to_i16(*s)).collect();
-                let _ = out_tx.send(pcm);
+                // `try_send` instead of `send`: if the consumer is behind
+                // we drop the frame rather than block the cpal callback
+                // thread (real-time audio principle: stale audio helps
+                // nobody; latency growth is the worse failure mode).
+                let _ = out_tx.try_send(pcm);
             },
             err_fn,
             None,
