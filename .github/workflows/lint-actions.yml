@@ -54,6 +54,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          persist-credentials: false
       # `astral-sh/setup-uv` is great for Python projects but here it just
       # installs a tool. It also (1) targets Node 20, which trips the
       # Node 20 deprecation warning, and (2) attempts to build a cache key
@@ -62,5 +64,11 @@ jobs:
       # mis-configuration.
       - name: Install zizmor
         run: pipx install zizmor
-      - name: Run zizmor
+      # zizmor refuses `--pedantic` together with `--persona=…` (they're
+      # mutually exclusive in the CLI). Run them as two gates so we get
+      # both the practical auditor pass AND the full pedantic ruleset.
+      # Either failing fails the job.
+      - name: Run zizmor (auditor persona)
+        run: zizmor --persona=auditor .github/workflows/
+      - name: Run zizmor (pedantic)
         run: zizmor --pedantic .github/workflows/
