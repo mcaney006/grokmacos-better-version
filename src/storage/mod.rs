@@ -200,6 +200,18 @@ impl Store {
         self.insert_message(message)
     }
 
+    pub fn delete_message(&self, message: &Message) -> Result<(), StorageError> {
+        let key = message_key(message);
+        let write = self.inner.db.begin_write()?;
+        {
+            let mut messages = write.open_table(TBL_MESSAGES)?;
+            messages.remove(key.as_slice())?;
+        }
+        write.commit()?;
+        self.inner.index.lock().delete_message(message.id)?;
+        Ok(())
+    }
+
     pub fn list_messages(&self, chat_id: Uuid) -> Result<Vec<Message>, StorageError> {
         let read = self.inner.db.begin_read()?;
         let messages = read.open_table(TBL_MESSAGES)?;
@@ -329,6 +341,25 @@ mod tests {
         assert_eq!(store.list_messages(chat.id).unwrap().len(), 5);
         store.delete_chat(chat.id).unwrap();
         assert!(store.list_messages(chat.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_message_drops_it_from_history_and_index() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let chat = Chat::new("xai", "grok-beta");
+        store.upsert_chat(&chat).unwrap();
+        let m = Message::new(chat.id, Role::User, "ephemeral note");
+        store.insert_message(&m).unwrap();
+        assert_eq!(store.list_messages(chat.id).unwrap().len(), 1);
+        assert!(!store.search("ephemeral", 5).unwrap().is_empty());
+
+        store.delete_message(&m).unwrap();
+        assert!(store.list_messages(chat.id).unwrap().is_empty());
+        assert!(
+            store.search("ephemeral", 5).unwrap().is_empty(),
+            "deleted message must vanish from the search index"
+        );
     }
 
     #[test]

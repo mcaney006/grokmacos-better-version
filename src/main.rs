@@ -8,8 +8,9 @@
 
 //! GrokInsane — cross-platform desktop client for xAI Grok and friends.
 //!
-//! Entrypoint sets up logging + paths, opens persistent storage, and hands
-//! control to `app::GrokApp` via eframe.
+//! Entrypoint sets up logging + paths, parses a small CLI surface for headless
+//! ops (`--version`, `--diag`, `--reset-db`), and otherwise hands control to
+//! `app::GrokApp` via eframe.
 
 mod app;
 mod config;
@@ -26,6 +27,10 @@ use anyhow::Context;
 
 fn main() -> anyhow::Result<()> {
     paths::ensure_dirs().context("failed to create app directories")?;
+
+    if let Some(action) = parse_cli() {
+        return run_cli(action);
+    }
 
     let _guards = init_tracing();
 
@@ -61,6 +66,108 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe exited: {e}"))?;
 
+    Ok(())
+}
+
+#[derive(Debug)]
+enum CliAction {
+    Version,
+    Help,
+    Diag,
+    ResetDb { confirm: bool },
+}
+
+fn parse_cli() -> Option<CliAction> {
+    let mut args = std::env::args().skip(1);
+    let first = args.next()?;
+    let action = match first.as_str() {
+        "--version" | "-V" => CliAction::Version,
+        "--help" | "-h" => CliAction::Help,
+        "--diag" => CliAction::Diag,
+        "--reset-db" => CliAction::ResetDb {
+            confirm: args.any(|a| a == "--yes"),
+        },
+        _ => CliAction::Help,
+    };
+    Some(action)
+}
+
+fn run_cli(action: CliAction) -> anyhow::Result<()> {
+    match action {
+        CliAction::Version => {
+            println!(
+                "grok-insane {} (rust >= {})",
+                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_RUST_VERSION")
+            );
+            Ok(())
+        }
+        CliAction::Help => {
+            print_help();
+            Ok(())
+        }
+        CliAction::Diag => diag(),
+        CliAction::ResetDb { confirm } => reset_db(confirm),
+    }
+}
+
+fn print_help() {
+    println!("grok-insane {}", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("USAGE:");
+    println!("    grok-insane                 launch the desktop app");
+    println!("    grok-insane --version       print version and exit");
+    println!("    grok-insane --diag          self-test storage, paths, secrets");
+    println!("    grok-insane --reset-db --yes  wipe local DB + search index");
+    println!("    grok-insane --help          this message");
+}
+
+fn diag() -> anyhow::Result<()> {
+    println!("data dir:    {}", paths::data_dir().display());
+    println!("config dir:  {}", paths::config_dir().display());
+    println!("cache dir:   {}", paths::cache_dir().display());
+    println!("db path:     {}", paths::db_path().display());
+    println!("index path:  {}", paths::index_path().display());
+    println!();
+
+    let store =
+        storage::Store::open(&paths::db_path(), &paths::index_path()).context("open store")?;
+    let n = store.count_messages().unwrap_or(0);
+    let chats = store.list_chats().unwrap_or_default();
+    println!("chats:       {}", chats.len());
+    println!("messages:    {n}");
+    println!();
+
+    for p in models::Provider::all() {
+        let label = match secrets::get_api_key(p.id()) {
+            Ok(Some(_)) => "present",
+            Ok(None) => "missing",
+            Err(e) => {
+                eprintln!("keyring [{}]: {e}", p.id());
+                "error"
+            }
+        };
+        println!("api key [{:9}] {}", p.id(), label);
+    }
+    Ok(())
+}
+
+fn reset_db(confirm: bool) -> anyhow::Result<()> {
+    if !confirm {
+        eprintln!("refusing to wipe data without --yes");
+        std::process::exit(2);
+    }
+    let db = paths::db_path();
+    let idx = paths::index_path();
+    if db.exists() {
+        std::fs::remove_file(&db).with_context(|| format!("remove {}", db.display()))?;
+    }
+    if idx.exists() {
+        std::fs::remove_dir_all(&idx).with_context(|| format!("remove {}", idx.display()))?;
+        std::fs::create_dir_all(&idx).ok();
+    }
+    println!("removed {}", db.display());
+    println!("removed {}", idx.display());
     Ok(())
 }
 

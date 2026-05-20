@@ -9,9 +9,12 @@ use crate::config::SettingsHandle;
 use crate::error::ApiError;
 use crate::models::{Chat, Message, PerfStats, Provider, Role, Settings, WireMessage};
 use crate::secrets;
+use crate::services::anthropic::AnthropicClient;
 use crate::services::audio::VoiceAudio;
 use crate::services::chat::XaiClient;
 use crate::services::embeddings::Retriever;
+use crate::services::local::LocalClient;
+use crate::services::openai::OpenAiClient;
 use crate::services::providers::{ChatEvent, ChatProvider, ChatRequest};
 use crate::services::voice::{VoiceEvent, VoiceSession};
 use crate::storage::Store;
@@ -496,6 +499,139 @@ impl GrokApp {
         });
     }
 
+    fn toggle_pin(&mut self, id: Uuid) {
+        if let Some(c) = self.chats.iter_mut().find(|c| c.id == id) {
+            c.pinned = !c.pinned;
+            c.updated_at = chrono::Utc::now();
+            if let Err(e) = self.store.upsert_chat(c) {
+                self.toaster.error(format!("pin: {e}"));
+            }
+        }
+        // Re-sort so pinned chats bubble to the top of the rail.
+        self.chats.sort_by(|a, b| {
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+        });
+    }
+
+    fn toggle_archive(&mut self, id: Uuid) {
+        if let Some(c) = self.chats.iter_mut().find(|c| c.id == id) {
+            c.archived = !c.archived;
+            c.updated_at = chrono::Utc::now();
+            if let Err(e) = self.store.upsert_chat(c) {
+                self.toaster.error(format!("archive: {e}"));
+            }
+        }
+    }
+
+    fn rename_chat(&mut self, id: Uuid, title: String) {
+        let title = if title.is_empty() {
+            "New Chat".to_string()
+        } else {
+            title
+        };
+        if let Some(c) = self.chats.iter_mut().find(|c| c.id == id) {
+            c.title = title;
+            c.updated_at = chrono::Utc::now();
+            if let Err(e) = self.store.upsert_chat(c) {
+                self.toaster.error(format!("rename: {e}"));
+            }
+        }
+    }
+
+    fn export_chat(&mut self, id: Uuid, format: crate::services::export::Format) {
+        let Some(chat) = self.chats.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        let messages = match self.store.list_messages(id) {
+            Ok(m) => m,
+            Err(e) => {
+                self.toaster.error(format!("export read: {e}"));
+                return;
+            }
+        };
+        let body = crate::services::export::export(&chat, &messages, format);
+        let safe_title: String = chat
+            .title
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect();
+        let filename = format!(
+            "grok-insane-{}-{}.{}",
+            safe_title,
+            chat.created_at.format("%Y%m%d-%H%M%S"),
+            format.extension()
+        );
+        let dest = crate::paths::data_dir().join("exports").join(&filename);
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                self.toaster.error(format!("mkdir: {e}"));
+                return;
+            }
+        }
+        match std::fs::write(&dest, body) {
+            Ok(()) => self.toaster.info(format!("exported to {}", dest.display())),
+            Err(e) => self.toaster.error(format!("write: {e}")),
+        }
+    }
+
+    /// Truncate the chat to the message immediately before the targeted
+    /// assistant reply, then re-run completion. The targeted reply is removed
+    /// from history so the new generation takes its place.
+    fn regenerate(&mut self, target: Uuid) {
+        if self.streaming_message_id.is_some() {
+            self.toaster.warn("wait for current generation to finish");
+            return;
+        }
+        let Some(idx) = self.messages.iter().position(|m| m.id == target) else {
+            return;
+        };
+        let target_msg = self.messages[idx].clone();
+        if !matches!(target_msg.role, Role::Assistant) {
+            return;
+        }
+        let chat_id = target_msg.chat_id;
+
+        // Drop the targeted assistant message + everything after it. We need a
+        // *user* turn to resume from, so find the preceding user message.
+        let resume_from = self.messages[..idx]
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::User))
+            .cloned();
+        let Some(user_msg) = resume_from else {
+            self.toaster
+                .warn("no prior user message to regenerate from");
+            return;
+        };
+        let last_user_idx = self
+            .messages
+            .iter()
+            .position(|m| m.id == user_msg.id)
+            .unwrap_or(idx);
+
+        // Hard-delete the assistant reply + any later messages.
+        for m in self.messages.split_off(last_user_idx + 1) {
+            if let Err(e) = self.store.delete_message(&m) {
+                tracing::warn!(error = %e, "delete during regenerate failed");
+            }
+        }
+        // Also remove the user turn we're replaying — `send_user_message`
+        // re-inserts it so we don't end up with a duplicate.
+        if let Err(e) = self.store.delete_message(&user_msg) {
+            tracing::warn!(error = %e, "delete user during regenerate failed");
+        }
+        self.messages.retain(|m| m.id != user_msg.id);
+
+        if let Some(c) = self.chats.iter_mut().find(|c| c.id == chat_id) {
+            c.updated_at = chrono::Utc::now();
+            let _ = self.store.upsert_chat(c);
+        }
+        let body = user_msg.content;
+        self.send_user_message(body);
+    }
+
     fn tick_perf(&mut self) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
@@ -544,13 +680,9 @@ async fn run_completion(
 ) -> Result<(), ApiError> {
     let client: Box<dyn ChatProvider + Send + Sync> = match provider {
         Provider::Xai => Box::new(XaiClient::new(api_key)),
-        _ => {
-            let _ = tx.send(StreamMsg::Error(
-                assistant_id,
-                format!("provider {} not yet implemented", provider.id()),
-            ));
-            return Ok(());
-        }
+        Provider::OpenAi => Box::new(OpenAiClient::new(api_key)),
+        Provider::Anthropic => Box::new(AnthropicClient::new(api_key)),
+        Provider::Local => Box::new(LocalClient::new(api_key)),
     };
     let mut stream = client.stream(request).await?;
     use futures_util::StreamExt;
@@ -659,6 +791,10 @@ impl eframe::App for GrokApp {
                     SidebarAction::Search(q) => {
                         self.search_hits = self.store.search(&q, 40).unwrap_or_default();
                     }
+                    SidebarAction::TogglePin(id) => self.toggle_pin(id),
+                    SidebarAction::ToggleArchive(id) => self.toggle_archive(id),
+                    SidebarAction::Rename(id, title) => self.rename_chat(id, title),
+                    SidebarAction::Export(id, format) => self.export_chat(id, format),
                 }
             });
 
@@ -685,8 +821,8 @@ impl eframe::App for GrokApp {
                     ctx.copy_text(text);
                     self.toaster.info("copied");
                 }
-                if action.regenerate.is_some() {
-                    self.toaster.info("regenerate not yet implemented");
+                if let Some(target) = action.regenerate {
+                    self.regenerate(target);
                 }
                 if action.toggle_voice {
                     self.toggle_voice();

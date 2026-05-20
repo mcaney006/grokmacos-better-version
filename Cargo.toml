@@ -32,6 +32,7 @@ eframe = { version = "0.34", default-features = false, features = [
 ] }
 egui = "0.34"
 egui_extras = { version = "0.34", features = ["all_loaders"] }
+egui_commonmark = { version = "0.23", default-features = false }
 
 # --- Async runtime + networking ---
 tokio = { version = "1", features = ["full"] }
