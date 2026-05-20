@@ -85,9 +85,39 @@ pub enum ApiError {
         message: String,
         request_id: String,
     },
+    /// HTTP 429 from the provider. Distinct from `BadStatus` so callers
+    /// can apply backoff instead of surfacing a generic "server returned
+    /// 429" error. `retry_after` is parsed from the `Retry-After` header
+    /// when present (seconds-form only — HTTP-date form is ignored as
+    /// providers don't use it for rate limiting in practice).
+    #[error("rate limited{retry_hint}")]
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+        /// Pre-formatted `" (retry after Ns)"` or empty. Display-only.
+        retry_hint: String,
+    },
 }
 
 impl ApiError {
+    /// Parse the `Retry-After` header value (RFC 7231 seconds-form only)
+    /// into a `Duration`. HTTP-date form returns `None` because providers
+    /// don't use it for rate limiting in practice.
+    pub fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+        value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs)
+    }
+
+    /// Build the rendered `retry_hint` string for the `RateLimited` display.
+    pub fn fmt_retry_hint(retry_after: Option<std::time::Duration>) -> String {
+        match retry_after {
+            Some(d) => format!(" (retry after {}s)", d.as_secs()),
+            None => String::new(),
+        }
+    }
+
     /// Render an `Option<String>` request-id into the bracketed form
     /// expected by the Display strings above. Keeps the formatting in one
     /// place so it stays consistent across variants.
@@ -96,6 +126,46 @@ impl ApiError {
             Some(rid) if !rid.is_empty() => format!(" (request-id {rid})"),
             _ => String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_retry_after_seconds_form() {
+        assert_eq!(
+            ApiError::parse_retry_after("5"),
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(
+            ApiError::parse_retry_after("  12  "),
+            Some(std::time::Duration::from_secs(12))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_http_date() {
+        // HTTP-date form: must not be misinterpreted as 0 seconds.
+        assert_eq!(
+            ApiError::parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"),
+            None
+        );
+        assert_eq!(ApiError::parse_retry_after(""), None);
+        assert_eq!(ApiError::parse_retry_after("-1"), None);
+    }
+
+    #[test]
+    fn rate_limited_display_includes_retry_hint() {
+        let err = ApiError::RateLimited {
+            retry_after: Some(std::time::Duration::from_secs(3)),
+            retry_hint: ApiError::fmt_retry_hint(Some(std::time::Duration::from_secs(3))),
+        };
+        let s = err.to_string();
+        assert!(s.contains("rate limited"), "{s}");
+        assert!(s.contains("retry after 3s"), "{s}");
     }
 }
 

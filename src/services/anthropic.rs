@@ -83,21 +83,13 @@ impl ChatProvider for AnthropicClient {
         );
 
         let url = format!("{}/messages", self.base.trim_end_matches('/'));
-        let resp = self
-            .http
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::BadStatus {
-                status: status.as_u16(),
-                body,
-            });
-        }
+        let resp = crate::services::chat::send_with_rate_limit_retry(
+            &self.http,
+            &url,
+            &headers,
+            &body,
+        )
+        .await?;
 
         let request_id = crate::services::chat::extract_request_id(resp.headers());
         let stream = resp.bytes_stream();

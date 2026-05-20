@@ -139,26 +139,87 @@ impl ChatProvider for XaiClient {
         );
 
         let url = format!("{}/chat/completions", self.base.trim_end_matches('/'));
-        let resp = self
-            .http
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::BadStatus {
-                status: status.as_u16(),
-                body,
-            });
-        }
+        let resp = send_with_rate_limit_retry(&self.http, &url, &headers, &body).await?;
 
         let request_id = extract_request_id(resp.headers());
         let stream = resp.bytes_stream();
         Ok(Box::pin(sse_to_events(stream, request_id)))
+    }
+}
+
+/// Default per-stream retry budget for HTTP 429. Bounded so a sustained
+/// rate-limit cycle surfaces to the user instead of hanging indefinitely.
+pub(crate) const RATE_LIMIT_RETRY_ATTEMPTS: usize = 3;
+/// Cap on the wait we'll honour from a server-provided `Retry-After`.
+/// Anthropic and xAI typically send small values (<=10s); a malicious or
+/// confused proxy that sends `Retry-After: 86400` should not freeze our
+/// app — we cap, retry once, then surface the error.
+pub(crate) const RATE_LIMIT_MAX_WAIT_SECS: u64 = 30;
+
+/// Send a request with bounded pre-first-byte retry on HTTP 429. The
+/// `build`-style alternative (closure that rebuilds RequestBuilder each
+/// attempt) was simpler in shape but harder to use because
+/// `RequestBuilder` isn't `Clone`. Taking the raw pieces and assembling
+/// a fresh request inside the loop keeps the call sites simple and
+/// retries truly fresh (new TCP, new TLS handshake if needed).
+///
+/// "Pre-first-byte only" means: we retry the entire send, but we never
+/// touch a stream once `bytes_stream()` has been called on it. Mid-stream
+/// failures propagate as-is.
+pub(crate) async fn send_with_rate_limit_retry<B: serde::Serialize>(
+    http: &Client,
+    url: &str,
+    headers: &HeaderMap,
+    body: &B,
+) -> Result<reqwest::Response, ApiError> {
+    let mut attempt = 0usize;
+    loop {
+        let resp = http
+            .post(url)
+            .headers(headers.clone())
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        if status.as_u16() == 429 && attempt + 1 < RATE_LIMIT_RETRY_ATTEMPTS {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(ApiError::parse_retry_after);
+            let wait = retry_after
+                .map(|d| {
+                    if d.as_secs() > RATE_LIMIT_MAX_WAIT_SECS {
+                        std::time::Duration::from_secs(RATE_LIMIT_MAX_WAIT_SECS)
+                    } else {
+                        d
+                    }
+                })
+                .unwrap_or_else(|| std::time::Duration::from_millis(500 << attempt));
+            tracing::warn!(?wait, attempt, url = %url, "rate-limited; backing off");
+            tokio::time::sleep(wait).await;
+            attempt += 1;
+            continue;
+        }
+        if status.as_u16() == 429 {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(ApiError::parse_retry_after);
+            return Err(ApiError::RateLimited {
+                retry_hint: ApiError::fmt_retry_hint(retry_after),
+                retry_after,
+            });
+        }
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ApiError::BadStatus {
+            status: status.as_u16(),
+            body,
+        });
     }
 }
 
