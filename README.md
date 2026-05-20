@@ -8,8 +8,11 @@ runs on macOS, Windows, and Linux.
 
 - **Native everywhere.** One Rust codebase, no Xcode, GPU-accelerated UI via
   `eframe` + `wgpu`.
-- **Streaming chat.** OpenAI-compatible Server-Sent Events parser feeds the UI
-  token-by-token as Grok generates.
+- **Streaming chat for four providers.** OpenAI-compatible SSE for xAI Grok
+  and OpenAI, native Anthropic Messages streaming, and any local
+  OpenAI-compatible endpoint (Ollama, LM Studio, llama.cpp server).
+- **Markdown rendering.** Assistant replies render through `egui_commonmark`
+  with code blocks, tables, and lists — code is cached so re-renders are free.
 - **Voice mode.** WebSocket client for `wss://api.x.ai/v1/realtime` plus a
   cross-platform `cpal` audio engine for capture + playback, with a live
   waveform widget and selectable personality (Ara / Rex / Sal / Eve / Leo).
@@ -17,12 +20,18 @@ runs on macOS, Windows, and Linux.
   fuzzy lookups stay fast even at 100k+ messages.
 - **Embedded ACID store.** All chats, messages, and settings live in `redb`
   next to the app, no external database needed.
+- **Chat management.** Pin, archive, rename, delete, and export any chat to
+  Markdown / Obsidian / JSON straight from the sidebar context menu.
+- **Regenerate.** Click ↻ on any assistant reply to truncate from the
+  preceding user turn and re-stream.
 - **Secure secrets.** API keys stored in the OS keyring (Keychain / Credential
   Manager / Secret Service).
 - **Optional local RAG.** Build with `--features rag` to add semantic
   retrieval over your own chat history via `fastembed`.
 - **Performance dashboard.** Toggle from settings to see frame time, tokens/s,
   request latency, and resident memory.
+- **CLI utilities.** `grok-insane --version`, `--diag`, `--reset-db --yes` for
+  headless smoke tests, support sessions, and CI.
 
 ## Build & run
 

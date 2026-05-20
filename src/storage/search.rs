@@ -83,6 +83,13 @@ impl SearchIndex {
         Ok(())
     }
 
+    pub fn delete_message(&mut self, msg_id: Uuid) -> Result<(), StorageError> {
+        let term = Term::from_field_text(self.fields.msg_id, &msg_id.to_string());
+        self.writer.delete_term(term);
+        self.writer.commit()?;
+        Ok(())
+    }
+
     pub fn delete_chat(&mut self, chat_id: Uuid) -> Result<(), StorageError> {
         let term = Term::from_field_text(self.fields.chat_id, &chat_id.to_string());
         self.writer.delete_term(term);

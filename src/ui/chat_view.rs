@@ -1,8 +1,13 @@
 //! Center panel: chat transcript + input.
+//!
+//! Assistant messages are rendered through `egui_commonmark` so Markdown,
+//! tables, lists, and fenced code blocks all look right. User messages stay
+//! plain text since they're the user's own input.
 
 use crate::models::{Chat, Message, Role};
 use crate::theme;
 use egui::{Align, Color32, Layout, RichText, ScrollArea, Stroke, TextEdit, Ui, Vec2};
+use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 #[derive(Debug, Default)]
 pub struct ChatAction {
@@ -26,6 +31,11 @@ pub struct ChatViewState {
     pub tts_enabled: bool,
     /// Cached phase used by the waveform widget.
     pub waveform_phase: f32,
+    /// Shared markdown cache. Reused across renders so syntax-highlighted
+    /// code blocks aren't re-parsed every frame.
+    pub md_cache: CommonMarkCache,
+    /// Render assistant messages as Markdown (default) vs plain text.
+    pub render_markdown: bool,
 }
 
 impl Default for ChatViewState {
@@ -38,6 +48,8 @@ impl Default for ChatViewState {
             mic_level: 0.0,
             tts_enabled: true,
             waveform_phase: 0.0,
+            md_cache: CommonMarkCache::default(),
+            render_markdown: true,
         }
     }
 }
@@ -53,7 +65,7 @@ pub fn render(
     ui.vertical(|ui| {
         render_header(ui, chat);
         ui.separator();
-        render_transcript(ui, messages, &mut action);
+        render_transcript(ui, state, messages, &mut action);
         render_composer(ui, state, &mut action);
     });
 
@@ -74,12 +86,20 @@ fn render_header(ui: &mut Ui, chat: Option<&Chat>) {
                         .small()
                         .color(Color32::from_rgb(140, 150, 160)),
                 );
+                if c.pinned {
+                    ui.label(RichText::new("📌").color(theme::ACCENT));
+                }
             }
         });
     });
 }
 
-fn render_transcript(ui: &mut Ui, messages: &[Message], action: &mut ChatAction) {
+fn render_transcript(
+    ui: &mut Ui,
+    state: &mut ChatViewState,
+    messages: &[Message],
+    action: &mut ChatAction,
+) {
     ScrollArea::vertical()
         .stick_to_bottom(true)
         .auto_shrink([false, false])
@@ -97,14 +117,14 @@ fn render_transcript(ui: &mut Ui, messages: &[Message], action: &mut ChatAction)
                 return;
             }
             for m in messages {
-                render_message(ui, m, action);
+                render_message(ui, state, m, action);
                 ui.add_space(8.0);
             }
             ui.add_space(8.0);
         });
 }
 
-fn render_message(ui: &mut Ui, m: &Message, action: &mut ChatAction) {
+fn render_message(ui: &mut Ui, state: &mut ChatViewState, m: &Message, action: &mut ChatAction) {
     let is_user = matches!(m.role, Role::User);
     let bubble_fill = if is_user {
         theme::USER_BUBBLE
@@ -137,7 +157,15 @@ fn render_message(ui: &mut Ui, m: &Message, action: &mut ChatAction) {
                                     .color(Color32::from_rgb(140, 150, 160)),
                             );
                             ui.add_space(2.0);
-                            ui.label(RichText::new(&m.content).color(Color32::WHITE));
+                            if is_user || !state.render_markdown {
+                                ui.label(RichText::new(&m.content).color(Color32::WHITE));
+                            } else {
+                                CommonMarkViewer::new().max_image_width(Some(560)).show(
+                                    ui,
+                                    &mut state.md_cache,
+                                    &m.content,
+                                );
+                            }
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(m.created_at.format("%H:%M:%S").to_string())
@@ -146,7 +174,7 @@ fn render_message(ui: &mut Ui, m: &Message, action: &mut ChatAction) {
                                 );
                                 if let Some(t) = m.tokens {
                                     ui.label(
-                                        RichText::new(format!("· {} tok", t))
+                                        RichText::new(format!("· {t} tok"))
                                             .small()
                                             .color(Color32::from_rgb(110, 120, 130)),
                                     );
