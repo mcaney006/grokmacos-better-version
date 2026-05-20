@@ -13,6 +13,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
+  # Force JS actions onto the Node.js 24 runtime ahead of the June 2, 2026
+  # default flip. Pinned actions/* below are already Node-24 capable; this is
+  # belt-and-braces against any transitive JS action picking up Node 20.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -26,7 +30,7 @@ jobs:
           - { os: windows-latest, label: "windows (x86_64)" }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -41,9 +45,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          # Include the runner architecture so macOS arm64 and any future
+          # macOS x86_64 entries don't poison each other's incremental cache.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Install OS dev deps (Linux only)
         if: matrix.os == 'ubuntu-latest'

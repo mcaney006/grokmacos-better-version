@@ -450,6 +450,20 @@ fn install_deps() -> Result<()> {
             println!("install-deps: no apt-get found; install equivalents manually.");
             return Ok(());
         }
+        // Refresh the package index first. GitHub-hosted runner images bake
+        // an apt cache, but it goes stale within a few days — `apt-get install`
+        // then fails with `E: Unable to locate package` or `E: Version 'X' for
+        // 'Y' was not found` once Ubuntu rotates the published version. An
+        // `update` here is the difference between a flaky build and a stable
+        // one.
+        let mut update = Command::new("sudo");
+        update
+            .arg("apt-get")
+            .arg("update")
+            .arg("-y")
+            .env("DEBIAN_FRONTEND", "noninteractive");
+        run_cmd(&mut update)?;
+
         let pkgs = [
             "libasound2-dev",
             "libxkbcommon-dev",
@@ -461,7 +475,11 @@ fn install_deps() -> Result<()> {
             "libfontconfig1-dev",
         ];
         let mut cmd = Command::new("sudo");
-        cmd.arg("apt-get").arg("install").arg("-y");
+        cmd.arg("apt-get")
+            .arg("install")
+            .arg("-y")
+            .arg("--no-install-recommends")
+            .env("DEBIAN_FRONTEND", "noninteractive");
         for p in pkgs {
             cmd.arg(p);
         }
