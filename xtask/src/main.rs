@@ -582,6 +582,205 @@ fn release() -> Result<()> {
     Ok(())
 }
 
+// =========================================================================
+// Release packaging + signing stages
+// =========================================================================
+//
+// These were previously inline bash/pwsh blocks in
+// .github/workflows/release.yml. Pulling them into xtask gives the same
+// "one source of truth, runs identically locally and in CI" benefit as the
+// other CI stages, and means the only `run:` blocks left in release.yml
+// are the ones that genuinely have to call into shell tools (macOS
+// keychain import via `security`, GitHub OIDC + Sigstore Fulcio handshake
+// — those are not appropriate to reimplement in Rust).
+
+/// Compute SOURCE_DATE_EPOCH from the tip commit's authored timestamp and
+/// write it into `$GITHUB_ENV` so all subsequent steps see it. Without
+/// `$GITHUB_ENV` set (i.e. running locally), prints the value so a human
+/// can `export` it manually.
+fn compute_source_date_epoch() -> Result<()> {
+    let sde = git_commit_timestamp().context("read commit timestamp via `git log`")?;
+    println!("SOURCE_DATE_EPOCH={sde}");
+    if let Ok(path) = env::var("GITHUB_ENV") {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open {path} for append"))?;
+        writeln!(f, "SOURCE_DATE_EPOCH={sde}")?;
+    }
+    Ok(())
+}
+
+/// Stage the Linux/macOS release tarball: `dist/<triple>/grok-insane-<ref>-<triple>.tar.gz`.
+/// The tarball contains the binary + README. Same shape as the previous
+/// inline `tar -C dist -czf …` block, but now reachable from local builds
+/// too via `cargo xtask ci --stage package-tarball`.
+fn package_tarball() -> Result<()> {
+    let triple = host_target_triple();
+    let out_dir = workspace_root().join("dist").join(&triple);
+    std::fs::create_dir_all(&out_dir).context("create dist dir")?;
+
+    // The build stage should have placed the binary at dist/<triple>/grok-insane.
+    let bin = out_dir.join(bin_name());
+    if !bin.exists() {
+        bail!(
+            "expected {} (run `cargo xtask ci --stage build` first)",
+            bin.display()
+        );
+    }
+    if let Ok(readme) = std::fs::read_to_string(workspace_root().join("README.md")) {
+        let _ = std::fs::write(out_dir.join("README.md"), readme);
+    }
+
+    let ref_name = env::var("GITHUB_REF_NAME").unwrap_or_else(|_| "dev".into());
+    // Write the tarball one level above the triple directory so we don't
+    // archive the archive into itself on re-run (which makes tar emit
+    // "file changed as we read it" and exit nonzero).
+    let tar_path = workspace_root()
+        .join("dist")
+        .join(format!("grok-insane-{ref_name}-{triple}.tar.gz"));
+
+    // System tar; every supported host (linux, macos) ships a working one.
+    // `-C dist <triple>` keeps paths inside the archive relative to the
+    // triple directory instead of using absolute paths.
+    let mut cmd = Command::new("tar");
+    cmd.current_dir(workspace_root().join("dist"))
+        .arg("-czf")
+        .arg(&tar_path)
+        .arg(&triple);
+    run_cmd(&mut cmd)?;
+    println!("tarball: {}", tar_path.display());
+    Ok(())
+}
+
+/// Stage the Windows release zip. Split into two cfg-conditional
+/// definitions so clippy's `needless_return` lint stays happy on each
+/// platform.
+#[cfg(not(target_os = "windows"))]
+fn package_zip() -> Result<()> {
+    println!("package-zip: not on Windows, skipping.");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn package_zip() -> Result<()> {
+    let triple = host_target_triple();
+    let out_dir = workspace_root().join("dist").join(&triple);
+    std::fs::create_dir_all(&out_dir).context("create dist dir")?;
+    let exe = out_dir.join("grok-insane.exe");
+    if !exe.exists() {
+        bail!(
+            "expected {} (run `cargo xtask ci --stage build` first)",
+            exe.display()
+        );
+    }
+    let ref_name = env::var("GITHUB_REF_NAME").unwrap_or_else(|_| "dev".into());
+    // Write the zip one level above the binary so we don't archive the
+    // archive into itself on re-run.
+    let zip_path = workspace_root()
+        .join("dist")
+        .join(format!("grok-insane-{ref_name}-{triple}.zip"));
+
+    // Compress-Archive ships on every supported Windows runner; `-Force`
+    // lets a re-run overwrite a previous zip without failing.
+    let mut cmd = Command::new("powershell");
+    cmd.arg("-NoProfile").arg("-Command").arg(format!(
+        "Compress-Archive -Path '{}' -DestinationPath '{}' -Force",
+        exe.display(),
+        zip_path.display()
+    ));
+    run_cmd(&mut cmd)?;
+    println!("zip: {}", zip_path.display());
+    Ok(())
+}
+
+/// Sign every release artifact in `dist/<triple>/` with cosign keyless. A
+/// detached cosign bundle (signature + cert + Rekor entry) lands next to
+/// the original file. Skips silently when cosign isn't on PATH so local
+/// invocations don't fail.
+///
+/// Iterating files in Rust (`std::fs::read_dir`) instead of in shell means
+/// we get a deterministic order and proper error handling — the previous
+/// inline `for f in $OUT/*.dmg …` shell-glob silently no-op'd if no files
+/// matched, which is the wrong default for a release signing step.
+fn sign_artifacts() -> Result<()> {
+    if which("cosign").is_none() {
+        println!("sign-artifacts: cosign not on PATH; skipping (set up via sigstore/cosign-installer in CI)");
+        return Ok(());
+    }
+    let triple = host_target_triple();
+    let dist_root = workspace_root().join("dist");
+    let triple_dir = dist_root.join(&triple);
+
+    // Two locations to walk:
+    //   dist/<triple>/  -- .dmg, .sbom.json, SHA256SUMS
+    //   dist/           -- .tar.gz, .zip (live one level up so package-*
+    //                      stages don't recursively include their own
+    //                      output)
+    let mut signed = 0u32;
+    for scan in [&dist_root, &triple_dir] {
+        if !scan.exists() {
+            continue;
+        }
+        signed += sign_files_in(scan)?;
+    }
+    if signed == 0 {
+        bail!(
+            "sign-artifacts: no signable files in {} or {} (did build/package stages run?)",
+            dist_root.display(),
+            triple_dir.display()
+        );
+    }
+    println!("sign-artifacts: signed {signed} file(s)");
+    Ok(())
+}
+
+/// Sign every signable file in `dir` (non-recursive). Returns the count.
+/// Signable suffixes are `.dmg`, `.tar.gz`, `.zip`, `.json`. Already-signed
+/// outputs (`.cosign-bundle`) and our telemetry file are skipped.
+fn sign_files_in(dir: &Path) -> Result<u32> {
+    let signable_exts = ["dmg", "tar.gz", "zip", "json"];
+    let mut count = 0u32;
+    for entry in std::fs::read_dir(dir).context("read dist dir")? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if name.ends_with(".cosign-bundle") || name == "xtask-metrics.jsonl" {
+            continue;
+        }
+        let signable = signable_exts
+            .iter()
+            .any(|ext| name.ends_with(&format!(".{ext}")));
+        if !signable {
+            continue;
+        }
+        let bundle = path.with_extension(format!(
+            "{}.cosign-bundle",
+            path.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("bundle")
+        ));
+        println!("::group::cosign sign-blob {}", path.display());
+        let mut cmd = Command::new("cosign");
+        cmd.arg("sign-blob")
+            .arg("--yes")
+            .arg("--bundle")
+            .arg(&bundle)
+            .arg(&path);
+        run_cmd(&mut cmd)?;
+        println!("::endgroup::");
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// Deeper clean than `cargo clean`: also removes `dist/` and the registry
 /// download cache. Use this if a corrupted cache is causing weird build
 /// errors that survive a plain `cargo clean`.
@@ -1011,6 +1210,12 @@ enum CiStage {
     Sbom,
     Hygiene,
     Reproducible,
+    // Release-only stages. Used from .github/workflows/release.yml so the
+    // tarball/zip layout + Sigstore signing live in Rust, not inline shell.
+    PackageTarball,
+    PackageZip,
+    SignArtifacts,
+    ComputeSourceDateEpoch,
 }
 
 impl CiStage {
@@ -1025,6 +1230,10 @@ impl CiStage {
             CiStage::Sbom => "sbom",
             CiStage::Hygiene => "hygiene",
             CiStage::Reproducible => "reproducible",
+            CiStage::PackageTarball => "package-tarball",
+            CiStage::PackageZip => "package-zip",
+            CiStage::SignArtifacts => "sign-artifacts",
+            CiStage::ComputeSourceDateEpoch => "compute-source-date-epoch",
         }
     }
 
@@ -1039,9 +1248,15 @@ impl CiStage {
             "sbom" => CiStage::Sbom,
             "hygiene" => CiStage::Hygiene,
             "reproducible" => CiStage::Reproducible,
+            "package-tarball" => CiStage::PackageTarball,
+            "package-zip" => CiStage::PackageZip,
+            "sign-artifacts" => CiStage::SignArtifacts,
+            "compute-source-date-epoch" | "compute-sde" => CiStage::ComputeSourceDateEpoch,
             other => bail!(
                 "unknown ci stage `{other}`. valid stages: install-deps, fmt, \
-                 clippy, test, build, audit, sbom, hygiene, reproducible"
+                 clippy, test, build, audit, sbom, hygiene, reproducible, \
+                 package-tarball, package-zip, sign-artifacts, \
+                 compute-source-date-epoch"
             ),
         })
     }
@@ -1064,6 +1279,10 @@ impl CiStage {
             CiStage::Sbom => sbom(),
             CiStage::Hygiene => hygiene(),
             CiStage::Reproducible => reproducible(),
+            CiStage::PackageTarball => package_tarball(),
+            CiStage::PackageZip => package_zip(),
+            CiStage::SignArtifacts => sign_artifacts(),
+            CiStage::ComputeSourceDateEpoch => compute_source_date_epoch(),
         }
     }
 

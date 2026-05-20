@@ -1,17 +1,24 @@
 name: Release
 
-# Cuts a GitHub Release with signed + notarized macOS DMG (and platform
-# binaries for Linux + Windows) when you push a tag like `v0.1.0`.
+# Tag-driven release pipeline. Per artifact:
+#   1. Checkout + pinned rustc + cargo cache.
+#   2. (Linux only) install ALSA/X11/Wayland dev libs via xtask install-deps.
+#   3. (macOS only) import Apple Developer ID cert into ephemeral keychain.
+#   4. Compute SOURCE_DATE_EPOCH into $GITHUB_ENV via xtask.
+#   5. Build + (macOS) sign + notarize + DMG via xtask.
+#   6. Generate CycloneDX SBOM via xtask.
+#   7. Package per-platform archive (tarball / zip) via xtask.
+#   8. cosign keyless-sign every artifact via xtask.
+#   9. SLSA build-provenance attestation via actions/attest-build-provenance.
+#  10. softprops/action-gh-release publishes the GitHub Release.
 #
-# Pipeline per artifact:
-#   1. SHA-pinned actions check out + install rustc from rust-toolchain.toml
-#   2. Release build (macOS path: sign + notarize + DMG via xtask)
-#   3. CycloneDX SBOM generated for the workspace and bundled with the artifact
-#   4. cosign sign-blob produces a keyless Sigstore signature + transparency
-#      log entry (Rekor) for every uploaded file
-#   5. softprops/action-gh-release attaches everything to a GitHub Release
-#
-# Apple secrets (see README "Releases" section for the full list).
+# Every step body that calls into project code is `cargo xtask ci --stage X`
+# or `cargo xtask <verb>`. The only `run:` blocks left contain code that
+# genuinely belongs in a GitHub Actions runner: the Apple keychain
+# bootstrap (calls `security`) and that's it. Sigstore signing + SLSA
+# provenance use the official third-party actions because those need
+# GitHub OIDC + the Sigstore Fulcio/Rekor protocol which we don't want
+# to reimplement.
 
 on:
   push:
@@ -31,10 +38,6 @@ env:
   RUST_BACKTRACE: short
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Workflow-wide floor is read-only. Each job below opts in to the precise
-# extra scopes it needs (id-token + attestations for signing, contents:write
-# for the final Release publish). Belt and braces against accidental
-# privilege inheritance.
 permissions: read-all
 
 jobs:
@@ -44,10 +47,6 @@ jobs:
       contents: read
       id-token: write       # OIDC token for Sigstore keyless signing
       attestations: write   # actions/attest-build-provenance writes here
-    # The `release` environment gates this job behind whatever review you
-    # configure on the GitHub side (required reviewers, wait timer, allowed
-    # branches/tags). Release signing should not happen because a workflow
-    # sneezed; it should happen because a maintainer approved it.
     environment:
       name: release
     strategy:
@@ -60,39 +59,23 @@ jobs:
           - { os: windows-latest, label: "Windows (x86_64)",triple: "x86_64-pc-windows-msvc",   artifact: "zip"    }
     runs-on: ${{ matrix.os }}
     steps:
-      # All actions are pinned by commit SHA. See the comment in ci.yml.
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           toolchain: "1.94.0"
           targets: ${{ matrix.triple }}
-
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           shared-key: release-${{ runner.os }}-${{ runner.arch }}
           cache-on-failure: false
 
-      - name: Install Linux deps
+      - name: install-deps
         if: matrix.os == 'ubuntu-latest'
-        run: cargo xtask install-deps
+        run: cargo xtask ci --stage install-deps
 
-      # Pin SOURCE_DATE_EPOCH to the commit's authored timestamp. Build
-      # toolchains and packaging steps that honour this variable will embed
-      # the commit time instead of "now", so two CI runs of the same tag
-      # produce identical artifacts (modulo unavoidable platform differences
-      # like the macOS code-signature blob). This is the "reproducibility
-      # proof" half of the reproducible-builds story; the other half is the
-      # rust-toolchain.toml + Cargo.lock + --locked combo.
-      - name: Compute SOURCE_DATE_EPOCH
-        shell: bash
-        run: |
-          set -euo pipefail
-          SDE="$(git log -1 --pretty=%ct)"
-          echo "SOURCE_DATE_EPOCH=$SDE" >> "$GITHUB_ENV"
-          echo "SOURCE_DATE_EPOCH set to $SDE ($(date -u -d @$SDE 2>/dev/null || true))"
-
-      # --- macOS: import codesigning cert into an ephemeral keychain --------
+      # The Apple keychain bootstrap stays as shell — it's a tight sequence
+      # of `security` CLI calls that genuinely belong on the runner. No
+      # Rust orchestration value to be had by re-wrapping it.
       - name: Set up macOS keychain
         if: startsWith(matrix.os, 'macos') && env.APPLE_CERTIFICATE_P12_BASE64 != ''
         env:
@@ -113,14 +96,14 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
           rm "$RUNNER_TEMP/cert.p12"
 
-      # --- Build ------------------------------------------------------------
-      - name: Release build (non-macOS)
-        if: ${{ !startsWith(matrix.os, 'macos') }}
-        # `--locked` enforces Cargo.lock; combined with rust-toolchain.toml
-        # that's the deterministic-build contract.
-        run: cargo build --release --target ${{ matrix.triple }} --locked
+      - name: compute-source-date-epoch
+        run: cargo xtask ci --stage compute-source-date-epoch
 
-      - name: Build + sign + notarize + DMG (macOS)
+      - name: build
+        if: ${{ !startsWith(matrix.os, 'macos') }}
+        run: cargo xtask ci --stage build
+
+      - name: build + sign + notarize + DMG (macOS)
         if: startsWith(matrix.os, 'macos')
         env:
           APPLE_DEVELOPER_ID_APPLICATION: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
@@ -129,88 +112,35 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD:    ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: cargo xtask dmg
 
-      # --- SBOM (CycloneDX 1.5 JSON) ----------------------------------------
-      # cargo-cyclonedx walks the dep graph and emits a deterministic JSON
-      # manifest that any SBOM consumer (dependency-track, Grype, Trivy) can
-      # ingest. Generated per-target so consumers see the actual deps used
-      # for *this* binary, not the union of all platforms.
-      - name: Install cargo-cyclonedx
-        run: cargo install --locked cargo-cyclonedx
+      - name: sbom
+        run: cargo xtask ci --stage sbom
 
-      - name: Generate SBOM
-        shell: bash
-        run: |
-          set -euo pipefail
-          OUT="dist/${{ matrix.triple }}"
-          mkdir -p "$OUT"
-          # The "all" format covers both JSON and XML so downstream tooling
-          # has a choice.
-          cargo cyclonedx \
-              --format json \
-              --target ${{ matrix.triple }} \
-              --override-filename "grok-insane-sbom"
-          # cargo-cyclonedx writes to the package root; move to the artifact dir.
-          mv grok-insane-sbom.cdx.json "$OUT/grok-insane-${{ github.ref_name }}-${{ matrix.triple }}.sbom.json" || true
-          ls -la "$OUT/"
-
-      # --- Stage final artifact names --------------------------------------
-      - name: Stage Linux tarball
+      - name: package-tarball
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          set -euo pipefail
-          OUT="dist/${{ matrix.triple }}"
-          mkdir -p "$OUT"
-          cp "target/${{ matrix.triple }}/release/grok-insane" "$OUT/grok-insane"
-          cp README.md "$OUT/" || true
-          tar -C dist -czf "$OUT/grok-insane-${GITHUB_REF_NAME:-dev}-${{ matrix.triple }}.tar.gz" \
-              "${{ matrix.triple }}"
-          ls -la "$OUT/"
+        run: cargo xtask ci --stage package-tarball
 
-      - name: Stage Windows zip
+      - name: package-zip
         if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          $out = "dist\${{ matrix.triple }}"
-          New-Item -ItemType Directory -Path $out -Force | Out-Null
-          Copy-Item "target\${{ matrix.triple }}\release\grok-insane.exe" "$out\grok-insane.exe"
-          Compress-Archive -Path "$out\grok-insane.exe" `
-                           -DestinationPath "$out\grok-insane-${{ github.ref_name }}-${{ matrix.triple }}.zip" `
-                           -Force
+        run: cargo xtask ci --stage package-zip
 
-      # --- Sigstore keyless signing ----------------------------------------
-      # Every release artifact (.dmg, .tar.gz, .zip, .sbom.json) gets a
-      # detached cosign signature with a Rekor transparency-log entry. No
-      # GPG keys to rotate; the signing identity is this workflow's OIDC
-      # token, recorded publicly in the Fulcio/Rekor logs.
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
 
-      - name: cosign sign release artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
-          OUT="dist/${{ matrix.triple }}"
-          shopt -s nullglob
-          for f in "$OUT"/*.dmg "$OUT"/*.tar.gz "$OUT"/*.zip "$OUT"/*.sbom.json; do
-            [ -e "$f" ] || continue
-            echo "::group::cosign sign $f"
-            cosign sign-blob --yes \
-                --bundle "$f.cosign-bundle" \
-                "$f"
-            echo "::endgroup::"
-          done
-          ls -la "$OUT/"
+      - name: sign-artifacts
+        run: cargo xtask ci --stage sign-artifacts
 
-      # --- Upload per-OS artifact ------------------------------------------
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: grok-insane-${{ matrix.triple }}
+          # Tarballs/zips land at dist/ (parent of triple); DMG, SBOM,
+          # signatures, hashes stay under dist/<triple>/.
           path: |
+            dist/*.tar.gz
+            dist/*.zip
             dist/${{ matrix.triple }}/*.dmg
-            dist/${{ matrix.triple }}/*.tar.gz
-            dist/${{ matrix.triple }}/*.zip
             dist/${{ matrix.triple }}/*.sbom.json
             dist/${{ matrix.triple }}/*.cosign-bundle
+            dist/${{ matrix.triple }}/SHA256SUMS
           if-no-files-found: warn
 
   release:
@@ -233,9 +163,6 @@ jobs:
       - name: List artifacts
         run: ls -laR artifacts/
 
-      # Build provenance attestation (SLSA Level 3) — proves these artifacts
-      # were produced by *this* workflow run, signed via the same Sigstore
-      # transparency log used for the artifact signatures.
       - name: Generate SLSA provenance attestation
         uses: actions/attest-build-provenance@b3e506e8c389afc651c5bacf2b8f2a1ea0557215  # v4
         with:
@@ -253,22 +180,27 @@ jobs:
           body: |
             ### Verifying this release
 
-            Every artifact below is signed via Sigstore (keyless OIDC) and
-            has a CycloneDX SBOM. To verify:
+            Every artifact below is signed via Sigstore (keyless OIDC), has a
+            CycloneDX SBOM, and a SHA256SUMS file. To verify:
 
             ```bash
+            # signature + transparency log
             cosign verify-blob \
                 --bundle <artifact>.cosign-bundle \
                 --certificate-identity-regexp 'https://github.com/${{ github.repository }}/.github/workflows/release\.yml@.*' \
                 --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
                 <artifact>
-            ```
 
-            The SLSA provenance attestation can be inspected with
-            `gh attestation verify <artifact> --owner ${{ github.repository_owner }}`.
+            # SLSA build provenance
+            gh attestation verify <artifact> --owner ${{ github.repository_owner }}
+
+            # File integrity
+            sha256sum -c SHA256SUMS
+            ```
           files: |
             artifacts/**/*.dmg
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
             artifacts/**/*.sbom.json
             artifacts/**/*.cosign-bundle
+            artifacts/**/SHA256SUMS
