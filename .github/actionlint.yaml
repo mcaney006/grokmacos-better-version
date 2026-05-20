@@ -1,0 +1,19 @@
+# Override actionlint's bundled runner-label list. Newer macOS runner
+# images use the `<base>-intel` / `<base>-xlarge` suffix convention that
+# older actionlint binaries don't know about yet. Listing them here keeps
+# `actionlint` happy across the version drift between contributors'
+# laptops and CI.
+#
+# Cross-reference:
+#   https://docs.github.com/actions/using-github-hosted-runners/about-github-hosted-runners
+
+self-hosted-runner:
+  labels:
+    - macos-15-intel
+    - macos-26-intel
+    - macos-26
+    - macos-26-xlarge
+    - macos-26-large
+    - windows-2025-vs2026
+    - windows-11-arm
+    - ubuntu-slim

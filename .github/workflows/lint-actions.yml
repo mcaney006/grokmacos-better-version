@@ -50,9 +50,17 @@ jobs:
   zizmor:
     name: zizmor (security audit)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff  # v6
+      # `astral-sh/setup-uv` is great for Python projects but here it just
+      # installs a tool. It also (1) targets Node 20, which trips the
+      # Node 20 deprecation warning, and (2) attempts to build a cache key
+      # from Python lockfiles that don't exist in this Rust repo. Use the
+      # pre-installed pipx on the runner instead — zero JS, zero cache
+      # mis-configuration.
+      - name: Install zizmor
+        run: pipx install zizmor
       - name: Run zizmor
-        run: |
-          uvx zizmor --pedantic --persona=auditor .github/workflows/
+        run: zizmor --pedantic --persona=auditor .github/workflows/
