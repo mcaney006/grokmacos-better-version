@@ -1,0 +1,30 @@
+# Force LF for every text file across all platforms.
+#
+# Why: GitHub-hosted Windows runners default to `core.autocrlf=true`, which
+# rewrites LF to CRLF on checkout. rustfmt then refuses the file (or worse,
+# reformats them) and `cargo fmt --check` exits 1 — but only on Windows.
+# This file disables that conversion for every source/config/text format we
+# care about, so checkout produces the same bytes on every runner.
+
+* text=auto eol=lf
+
+*.rs       text eol=lf
+*.toml     text eol=lf
+*.lock     text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.md       text eol=lf
+*.txt      text eol=lf
+*.sh       text eol=lf
+*.json     text eol=lf
+*.plist    text eol=lf
+
+# Treat font + binary blobs as binary so git doesn't try to diff them.
+*.ttf      binary
+*.otf      binary
+*.png      binary
+*.jpg      binary
+*.ico      binary
+*.dmg      binary
+*.zip      binary
+*.tar.gz   binary

@@ -55,15 +55,10 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.triple }}
 
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-release-
+          shared-key: release-${{ runner.os }}-${{ runner.arch }}
+          cache-on-failure: false
 
       - name: Install Linux deps
         if: matrix.os == 'ubuntu-latest'

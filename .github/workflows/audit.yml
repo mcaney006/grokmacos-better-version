@@ -45,13 +45,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/advisory-db
-          key: audit-${{ hashFiles('Cargo.lock') }}
+          shared-key: audit
       - name: Install cargo-audit
         run: cargo install --locked cargo-audit
       - name: Run audit

@@ -38,25 +38,35 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      # Rust-specific caching. Replaces actions/cache@v4 which targets Node
+      # 20 and emits a deprecation warning when force-flipped to Node 24.
+      # Swatinem/rust-cache@v2 understands `target/`, the cargo registry, and
+      # git checkout caches as one unit and is Node 24 native.
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          # Include the runner architecture so macOS arm64 and any future
-          # macOS x86_64 entries don't poison each other's incremental cache.
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-
+          shared-key: ci-${{ runner.os }}-${{ runner.arch }}
+          # Don't poison the cache if any step fails.
+          cache-on-failure: false
+
+      - name: Toolchain info
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          cargo fmt --version
+          cargo clippy --version
 
       - name: Install OS dev deps (Linux only)
         if: matrix.os == 'ubuntu-latest'
         run: cargo xtask install-deps
 
-      - name: Full check (fmt + clippy + test)
-        run: cargo xtask check
+      - name: Fmt check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
 
       - name: Release build
         run: cargo xtask dist
