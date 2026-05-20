@@ -1,16 +1,20 @@
 name: CI
 
+# Every step body in this file is `cargo xtask ci --stage <name>`. The Rust
+# orchestrator at `xtask/src/main.rs` (search for `fn run_stage`) owns the
+# behaviour: GHA `::group::` markers, $GITHUB_STEP_SUMMARY rows, telemetry,
+# error propagation. This YAML is a thin scheduler over a Rust state
+# machine — not the other way around.
+
 on:
   push:
     branches: [main, master]
   pull_request:
-  # `merge_group` lets GitHub's merge queue run CI on the synthetic merge
-  # commit (PR + main combined) before actually landing the PR. That is the
-  # difference between "this PR was green in isolation" and "main stays green
-  # after this PR lands alongside whatever else just merged."
+  # Merge queue (when enabled in repo settings) runs CI against the
+  # synthetic merge commit, not the PR tip, so main stays green after
+  # integration.
   merge_group:
 
-# Cancel in-flight runs for the same ref when a new commit lands.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -18,14 +22,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
-  # Force JS actions onto the Node.js 24 runtime ahead of the June 2, 2026
-  # default flip. Pinned actions/* below are already Node-24 capable; this is
-  # belt-and-braces against any transitive JS action picking up Node 20.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Workflow-wide token floor is read-only. Any job that needs more privilege
-# (e.g. writing artifact attestations) must explicitly elevate. This is the
-# GitHub-recommended "least privilege" posture for GITHUB_TOKEN.
+# Workflow-wide token floor: read-only. Each job opts in if it needs more.
 permissions: read-all
 
 jobs:
@@ -42,16 +41,9 @@ jobs:
           - { os: windows-latest, label: "windows (x86_64)" }
     runs-on: ${{ matrix.os }}
     steps:
-      # All actions are pinned by commit SHA, not floating tags. Dependabot
-      # (see .github/dependabot.yml) updates them with the version comment so
-      # provenance stays auditable. Replacing a release tag is a known
-      # supply-chain attack vector (tj-actions/changed-files, March 2025).
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
 
       - name: Install Rust
-        # Toolchain version is pinned to match rust-toolchain.toml exactly,
-        # so the runners can't accidentally float onto a newer stable that
-        # introduces new clippy lints under our `-D warnings` policy.
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           toolchain: "1.94.0"
@@ -62,51 +54,37 @@ jobs:
           shared-key: ci-${{ runner.os }}-${{ runner.arch }}
           cache-on-failure: false
 
-      - name: Toolchain info
-        run: |
-          rustc --version --verbose
-          cargo --version --verbose
-          cargo fmt --version
-          cargo clippy --version
+      # --- All step bodies below are the same: `cargo xtask ci --stage X`.
+      # The xtask binary handles the GHA-specific output, the step summary,
+      # and the telemetry. YAML stays declarative.
 
-      - name: Install OS dev deps (Linux only)
+      - name: install-deps
         if: matrix.os == 'ubuntu-latest'
-        run: cargo xtask install-deps
+        run: cargo xtask ci --stage install-deps
 
-      - name: Fmt check
-        run: cargo fmt --all -- --check
+      - name: fmt
+        run: cargo xtask ci --stage fmt
 
-      - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets --workspace -- -D warnings
+      - name: clippy
+        run: cargo xtask ci --stage clippy
 
-      - name: Test
-        run: cargo test --workspace
+      - name: test
+        run: cargo xtask ci --stage test
 
-      - name: Release build
-        run: cargo xtask dist
-
-      # Render a compact, copy-pasteable summary into the run page so
-      # reviewers don't have to scroll through 9 000 lines of ANSI.
-      - name: Job summary
-        if: always()
-        shell: bash
-        run: |
-          {
-            echo "## $(echo '${{ matrix.label }}')"
-            echo ""
-            echo "| Step | Result |"
-            echo "| --- | --- |"
-            echo "| Fmt check | ${{ steps.fmt-check.outcome || 'completed' }} |"
-            echo "| Clippy | ${{ steps.clippy.outcome || 'completed' }} |"
-            echo "| Test | ${{ steps.test.outcome || 'completed' }} |"
-            echo "| Release build | ${{ steps.release-build.outcome || 'completed' }} |"
-            echo ""
-            echo "rustc: \`$(rustc --version | head -1)\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: build
+        run: cargo xtask ci --stage build
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: grok-insane-${{ matrix.os }}
           path: dist/
+          if-no-files-found: ignore
+
+      - name: Upload xtask telemetry
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: xtask-metrics-${{ matrix.os }}
+          path: dist/xtask-metrics.jsonl
           if-no-files-found: ignore

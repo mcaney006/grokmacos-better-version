@@ -105,7 +105,7 @@ fn run() -> Result<()> {
         "dmg" => dmg(),
         "reset" => reset(),
         "install-deps" => install_deps(),
-        "ci" => ci(),
+        "ci" => ci(&rest),
         "clean" => clean(),
         "clean-deep" => clean_deep(),
         "help" | "-h" | "--help" => {
@@ -142,7 +142,12 @@ fn print_help() {
     println!("  dmg           macOS: bundle -> sign -> notarize -> staple -> .dmg in dist/");
     println!("  reset         wipe local app data");
     println!("  install-deps  install OS dev libs (Linux apt only)");
-    println!("  ci            install-deps + check + dist");
+    println!("  ci [--stage NAME]");
+    println!("                CI driver. No flag: run the whole pipeline.");
+    println!("                --stage NAME: run one stage (install-deps | fmt | clippy");
+    println!("                | test | build | audit | sbom | hygiene | reproducible).");
+    println!("                Inside GitHub Actions, emits ::group:: markers and writes");
+    println!("                rows to $GITHUB_STEP_SUMMARY.");
     println!("  clean         cargo clean + remove dist/");
     println!(
         "  clean-deep    cargo clean + remove dist/ + ~/.cargo/registry/cache for this workspace"
@@ -961,10 +966,200 @@ fn install_deps() -> Result<()> {
     Ok(())
 }
 
-fn ci() -> Result<()> {
-    install_deps()?;
-    check()?;
-    dist()?;
+// =========================================================================
+// CI driver
+// =========================================================================
+//
+// This is the "thin GHA YAML over a Rust orchestrator" half of the
+// engineering story. Workflow files no longer contain step *bodies*; each
+// `run:` block is now `cargo xtask ci --stage <name>`, and the truth about
+// what a stage does lives in the `CiStage::run` match below.
+//
+// Why this matters:
+//
+//   1. One source of truth. The same stage is what runs locally
+//      (`cargo xtask ci --stage fmt`) and what runs in CI. No more
+//      "passed locally, failed in CI" mysteries caused by drift between
+//      a YAML run block and the makefile that humans actually use.
+//
+//   2. Structured output. Each stage opens a GitHub Actions log group,
+//      runs, closes the group, then appends a row to the per-job
+//      `$GITHUB_STEP_SUMMARY` markdown table with duration + status +
+//      target. The summary becomes a one-glance triage tool.
+//
+//   3. Telemetry already lives in `record_metric`; the CI driver
+//      automatically gets per-stage rows in `dist/xtask-metrics.jsonl`
+//      so trends across runs are tail-able.
+//
+// Local invocation:
+//   cargo xtask ci                 # run every stage that makes sense
+//                                  # on this host
+//   cargo xtask ci --stage fmt     # run one stage
+//   cargo xtask ci --stage build
+//
+// CI invocation: see .github/workflows/ci.yml — every `run:` is a
+// `cargo xtask ci --stage <name>` line.
+
+#[derive(Debug, Clone, Copy)]
+enum CiStage {
+    InstallDeps,
+    Fmt,
+    Clippy,
+    Test,
+    Build,
+    Audit,
+    Sbom,
+    Hygiene,
+    Reproducible,
+}
+
+impl CiStage {
+    fn name(self) -> &'static str {
+        match self {
+            CiStage::InstallDeps => "install-deps",
+            CiStage::Fmt => "fmt",
+            CiStage::Clippy => "clippy",
+            CiStage::Test => "test",
+            CiStage::Build => "build",
+            CiStage::Audit => "audit",
+            CiStage::Sbom => "sbom",
+            CiStage::Hygiene => "hygiene",
+            CiStage::Reproducible => "reproducible",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "install-deps" => CiStage::InstallDeps,
+            "fmt" => CiStage::Fmt,
+            "clippy" => CiStage::Clippy,
+            "test" => CiStage::Test,
+            "build" => CiStage::Build,
+            "audit" => CiStage::Audit,
+            "sbom" => CiStage::Sbom,
+            "hygiene" => CiStage::Hygiene,
+            "reproducible" => CiStage::Reproducible,
+            other => bail!(
+                "unknown ci stage `{other}`. valid stages: install-deps, fmt, \
+                 clippy, test, build, audit, sbom, hygiene, reproducible"
+            ),
+        })
+    }
+
+    fn run(self) -> Result<()> {
+        match self {
+            CiStage::InstallDeps => install_deps(),
+            CiStage::Fmt => cargo(["fmt", "--all", "--", "--check"]),
+            CiStage::Clippy => cargo([
+                "clippy",
+                "--all-targets",
+                "--workspace",
+                "--",
+                "-D",
+                "warnings",
+            ]),
+            CiStage::Test => cargo(["test", "--workspace"]),
+            CiStage::Build => dist(),
+            CiStage::Audit => audit(),
+            CiStage::Sbom => sbom(),
+            CiStage::Hygiene => hygiene(),
+            CiStage::Reproducible => reproducible(),
+        }
+    }
+
+    /// Default stage order for `cargo xtask ci` with no `--stage`. Mirrors
+    /// the .github/workflows/ci.yml step order so local CI is faithful.
+    fn default_pipeline() -> Vec<CiStage> {
+        let mut v = Vec::new();
+        if cfg!(target_os = "linux") {
+            v.push(CiStage::InstallDeps);
+        }
+        v.extend([CiStage::Fmt, CiStage::Clippy, CiStage::Test, CiStage::Build]);
+        v
+    }
+}
+
+fn ci(args: &[String]) -> Result<()> {
+    // Two invocation modes:
+    //   `cargo xtask ci`                  -> run the default pipeline
+    //   `cargo xtask ci --stage <name>`   -> run one named stage
+    match args.first().map(String::as_str) {
+        None => {
+            for stage in CiStage::default_pipeline() {
+                run_stage(stage)?;
+            }
+            Ok(())
+        }
+        Some("--stage") => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("--stage requires a value"))?;
+            let stage = CiStage::parse(name)?;
+            run_stage(stage)
+        }
+        Some(other) => bail!("unknown ci flag `{other}`. usage: cargo xtask ci [--stage NAME]"),
+    }
+}
+
+/// Drive one CI stage with the GHA-aware ceremony: open a collapsible log
+/// group, run the stage, close the group, append a markdown row to the
+/// per-job step summary, and propagate any error.
+fn run_stage(stage: CiStage) -> Result<()> {
+    let in_ci = env::var("GITHUB_ACTIONS").as_deref() == Ok("true");
+    if in_ci {
+        println!("::group::xtask ci: {}", stage.name());
+    } else {
+        println!("\n==> ci stage: {}", stage.name());
+    }
+    let started = Instant::now();
+    let result = stage.run();
+    let elapsed = started.elapsed();
+    if in_ci {
+        println!("::endgroup::");
+    }
+    // Append a one-row summary regardless of pass/fail so a reader scanning
+    // the job summary sees every attempted stage.
+    append_step_summary(stage, &result, elapsed)?;
+    result
+}
+
+/// Append a row to `$GITHUB_STEP_SUMMARY` (when set) describing the stage's
+/// outcome. The first call in a workflow run writes the table header; later
+/// calls append rows. Outside CI, the file env var is unset and this is a
+/// no-op.
+fn append_step_summary(
+    stage: CiStage,
+    result: &Result<()>,
+    elapsed: std::time::Duration,
+) -> Result<()> {
+    let Ok(summary_path) = env::var("GITHUB_STEP_SUMMARY") else {
+        return Ok(());
+    };
+    let path = PathBuf::from(summary_path);
+    let need_header = !path.exists()
+        || std::fs::metadata(&path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    if need_header {
+        writeln!(
+            f,
+            "## CI stages\n\n| Stage | Status | Duration | Target |\n| --- | --- | --- | --- |"
+        )?;
+    }
+    let icon = if result.is_ok() { "✅" } else { "❌" };
+    let status = if result.is_ok() { "pass" } else { "fail" };
+    writeln!(
+        f,
+        "| `{}` | {icon} {} | {:.2}s | `{}` |",
+        stage.name(),
+        status,
+        elapsed.as_secs_f32(),
+        env!("BUILD_TARGET_TRIPLE"),
+    )?;
     Ok(())
 }
 
