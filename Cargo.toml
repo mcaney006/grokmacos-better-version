@@ -18,9 +18,17 @@ license.workspace = true
 description = "Cross-platform high-performance desktop client for xAI Grok with voice, search, and multi-provider support."
 publish = false
 
+[lib]
+name = "grok_insane"
+path = "src/lib.rs"
+
 [[bin]]
 name = "grok-insane"
 path = "src/main.rs"
+
+[[bench]]
+name = "storage"
+harness = false
 
 [features]
 default = []
@@ -128,6 +136,11 @@ core-foundation = "0.10"
 [dev-dependencies]
 tempfile = "3"
 pretty_assertions = "1"
+# Criterion for regression-detecting micro-benches over hot storage paths.
+# Default features include `cargo_bench_support` and stable plotters; we
+# disable plotters (no graphviz dep in CI) and keep just the cargo bench
+# integration so `cargo bench` works.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [profile.dev]
 opt-level = 1            # Debug builds still fast enough for UI iteration.

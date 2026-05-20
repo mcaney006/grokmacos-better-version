@@ -1,39 +1,12 @@
-// === Crate-wide hardening lints ============================================
-// `forbid` is stronger than `deny`: even an inner `#[allow]` cannot relax it.
-// If any future contributor (human or model) needs unsafe, they have to lift
-// this attribute deliberately in a PR, where it shows up in the diff.
-#![forbid(unsafe_code)]
-// Network input + serialized bytes from disk should never be wrapped through
-// `unwrap`/`expect` blindly. These two lints catch bare panic surface in our
-// own code.
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-// The `Err` variants of our error enums embed `reqwest::Error` (and friends),
-// which are intentionally large. We accept the size hit in exchange for clean
-// `?`-propagation; callers immediately surface the error to a toast and the
-// `Result` does not stay live on the stack.
-#![allow(clippy::result_large_err)]
-#![allow(clippy::items_after_test_module)]
-#![allow(clippy::field_reassign_with_default)]
-
 //! GrokInsane — cross-platform desktop client for xAI Grok and friends.
 //!
 //! Entrypoint sets up logging + paths, parses a small CLI surface for headless
 //! ops (`--version`, `--diag`, `--reset-db`), and otherwise hands control to
-//! `app::GrokApp` via eframe.
-
-mod app;
-mod config;
-mod error;
-mod models;
-mod paths;
-mod secrets;
-mod services;
-mod storage;
-mod theme;
-mod ui;
+//! `app::GrokApp` via eframe. All real code lives in the library crate; this
+//! file is the binary's `main()` plus its CLI dispatch.
 
 use anyhow::Context;
+use grok_insane::{app, models, paths, secrets, storage};
 
 fn main() -> anyhow::Result<()> {
     paths::ensure_dirs().context("failed to create app directories")?;
