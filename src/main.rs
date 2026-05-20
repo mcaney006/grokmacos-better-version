@@ -1,3 +1,13 @@
+// === Crate-wide hardening lints ============================================
+// `forbid` is stronger than `deny`: even an inner `#[allow]` cannot relax it.
+// If any future contributor (human or model) needs unsafe, they have to lift
+// this attribute deliberately in a PR, where it shows up in the diff.
+#![forbid(unsafe_code)]
+// Network input + serialized bytes from disk should never be wrapped through
+// `unwrap`/`expect` blindly. These two lints catch bare panic surface in our
+// own code.
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 // The `Err` variants of our error enums embed `reqwest::Error` (and friends),
 // which are intentionally large. We accept the size hit in exchange for clean
 // `?`-propagation; callers immediately surface the error to a toast and the
@@ -180,8 +190,24 @@ fn init_tracing() -> Vec<tracing_appender::non_blocking::WorkerGuard> {
     let file_appender = tracing_appender::rolling::daily(&log_dir, "grok-insane.log");
     let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,grok_insane=debug,wgpu=warn,winit=warn"));
+    // Default filter is intentionally conservative: our own crate at `debug`,
+    // every network/UI library at `warn`. This stops reqwest/hyper/tungstenite
+    // from emitting low-level frame traces that could capture an Authorization
+    // header or request body during a debug session.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "info,\
+             grok_insane=debug,\
+             wgpu=warn,\
+             winit=warn,\
+             reqwest=warn,\
+             hyper=warn,\
+             rustls=warn,\
+             tungstenite=warn,\
+             tokio_tungstenite=warn,\
+             h2=warn",
+        )
+    });
 
     tracing_subscriber::registry()
         .with(filter)

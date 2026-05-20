@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `cargo xtask` — Rust replacements for what would normally be shell scripts.
 //!
 //! Run any command with `cargo xtask <name>`. The set of names is:
@@ -46,6 +48,7 @@ fn run() -> Result<()> {
         "dev" => dev(&rest),
         "dist" => dist(),
         "bundle" => bundle(),
+        "audit" => audit(),
         "sign" => sign(),
         "notarize" => notarize(),
         "dmg" => dmg(),
@@ -75,6 +78,7 @@ fn print_help() {
     println!("  dev [args]    cargo run with debug logging (forwards extra args)");
     println!("  dist          cargo build --release, strip, copy to dist/<target>/");
     println!("  bundle        per-OS bundle in dist/  (.app / .exe / staged dir)");
+    println!("  audit         run cargo-audit + cargo-deny (installs them if missing)");
     println!("  sign          macOS: codesign --options runtime --timestamp with Developer ID");
     println!("  notarize      macOS: xcrun notarytool submit --wait + stapler");
     println!("  dmg           macOS: bundle -> sign -> notarize -> staple -> .dmg in dist/");
@@ -150,6 +154,40 @@ fn dist() -> Result<()> {
         .with_context(|| format!("copy {} -> {}", bin.display(), dest.display()))?;
     println!("dist: {}", dest.display());
     Ok(())
+}
+
+/// Supply-chain audit: RustSec advisories + license/source policy via
+/// `cargo-audit` and `cargo-deny`. Installs them on first run.
+fn audit() -> Result<()> {
+    ensure_installed("cargo-audit")?;
+    ensure_installed("cargo-deny")?;
+    cargo([
+        "audit",
+        "--deny",
+        "warnings",
+        "--ignore",
+        "RUSTSEC-2024-0384",
+        "--ignore",
+        "RUSTSEC-2024-0320",
+        "--ignore",
+        "RUSTSEC-2026-0002",
+        "--ignore",
+        "RUSTSEC-2025-0141",
+        "--ignore",
+        "RUSTSEC-2025-0119",
+        "--ignore",
+        "RUSTSEC-2024-0436",
+    ])?;
+    cargo(["deny", "check", "advisories", "bans", "sources", "licenses"])?;
+    Ok(())
+}
+
+fn ensure_installed(crate_name: &str) -> Result<()> {
+    if which(crate_name).is_some() {
+        return Ok(());
+    }
+    println!("xtask: installing {crate_name} (one-time)…");
+    cargo(["install", "--locked", crate_name])
 }
 
 fn bundle() -> Result<()> {
@@ -569,7 +607,6 @@ fn host_target_triple() -> String {
     "unknown-target".into()
 }
 
-#[cfg(target_os = "linux")]
 fn which(prog: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     env::split_paths(&path).find_map(|p| {

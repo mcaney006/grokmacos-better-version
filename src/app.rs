@@ -622,11 +622,27 @@ impl GrokApp {
             }
         };
         let body = crate::services::export::export(&chat, &messages, format);
+        // Filename sanitisation:
+        // 1. Replace every non-alphanumeric with `-` so titles can't smuggle
+        //    `..`, `/`, or NUL bytes into the path.
+        // 2. Cap at 64 chars so a pathological title can't blow past the OS
+        //    filename limit (255 bytes on most FS, less on some).
+        // 3. Collapse repeated `-` to keep the output readable.
         let safe_title: String = chat
             .title
             .chars()
             .map(|c| if c.is_alphanumeric() { c } else { '-' })
-            .collect();
+            .take(64)
+            .collect::<String>()
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("-");
+        let safe_title = if safe_title.is_empty() {
+            "chat".to_string()
+        } else {
+            safe_title
+        };
         let filename = format!(
             "grok-insane-{}-{}.{}",
             safe_title,

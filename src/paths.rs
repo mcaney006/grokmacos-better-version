@@ -19,8 +19,10 @@ fn dirs() -> &'static ProjectDirs {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let fallback = cwd.join(".grok-insane");
             std::fs::create_dir_all(&fallback).ok();
-            // SAFETY: `from_path` always returns `Some` for an existing path.
-            ProjectDirs::from_path(fallback).expect("fallback ProjectDirs")
+            // `from_path` returns Some for any owned PathBuf. If for any
+            // reason it didn't, build a minimal ProjectDirs against `.`.
+            #[allow(clippy::expect_used)] // see comment above
+            ProjectDirs::from_path(fallback).expect("ProjectDirs::from_path returns Some")
         })
     })
 }

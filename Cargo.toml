@@ -29,8 +29,13 @@ default = []
 rag = ["dep:fastembed"]
 # Global system-wide hotkeys (e.g. ⌘⇧V to toggle voice).
 hotkeys = ["dep:global-hotkey"]
-# Plugin host via WebAssembly (stub today, full surface area later).
-plugins = ["dep:wasmtime"]
+# Plugin host via WebAssembly. Reserved feature name — the implementation lives
+# on a follow-up branch. Was previously gated by `wasmtime = "26"`, but that
+# version has 15 outstanding RUSTSEC advisories (sandbox escapes, OOB writes,
+# data leaks). We refuse to ship that on the supply chain, even feature-gated.
+# When the plugin host work lands it must pull a current wasmtime (>= 38) and
+# re-enable this dep.
+plugins = []
 
 [dependencies]
 # --- UI ---
@@ -67,7 +72,10 @@ async-trait = "0.1"
 # --- Persistence + search ---
 redb = "2.2"
 tantivy = "0.22"
-bincode = "1.3"
+# bincode 1.x is unmaintained (RUSTSEC-2025-0141). 2.x is the supported line
+# with a configuration-based API; we use the serde compatibility shim so the
+# call sites stay tiny.
+bincode = { version = "2", features = ["serde"] }
 
 # --- Audio ---
 cpal = "0.17"
@@ -112,7 +120,7 @@ confy = "0.6"
 # --- Optional / feature-gated ---
 fastembed = { version = "4", optional = true }
 global-hotkey = { version = "0.8", optional = true }
-wasmtime = { version = "26", optional = true, default-features = false, features = ["cranelift", "async"] }
+# wasmtime is intentionally NOT a dependency — see the `plugins` feature comment.
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

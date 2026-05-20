@@ -22,6 +22,20 @@ pub mod search;
 
 use search::SearchIndex;
 
+// Centralised bincode 2 helpers. We use the standard config with a fixed-int
+// encoding and little-endian byte order so on-disk records are stable across
+// architectures. Anything that hits redb goes through these two functions.
+fn bincode_serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StorageError> {
+    bincode::serde::encode_to_vec(value, bincode::config::standard())
+        .map_err(|e| StorageError::Encode(e.to_string()))
+}
+
+fn bincode_deserialize<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError> {
+    let (value, _consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+        .map_err(|e| StorageError::Decode(e.to_string()))?;
+    Ok(value)
+}
+
 // --- table layout -----------------------------------------------------------
 
 /// Chats keyed by their `Uuid` bytes -> bincoded `Chat`.
@@ -108,14 +122,13 @@ impl Store {
         let read = self.inner.db.begin_read()?;
         let meta = read.open_table(TBL_META)?;
         match meta.get(META_SETTINGS)? {
-            Some(v) => Ok(bincode::deserialize::<Settings>(v.value())?),
+            Some(v) => bincode_deserialize::<Settings>(v.value()),
             None => Ok(Settings::default()),
         }
     }
 
     pub fn save_settings(&self, settings: &Settings) -> Result<(), StorageError> {
-        let bytes =
-            bincode::serialize(settings).map_err(|e| StorageError::Encode(e.to_string()))?;
+        let bytes = bincode_serialize(settings)?;
         let write = self.inner.db.begin_write()?;
         {
             let mut meta = write.open_table(TBL_META)?;
@@ -128,7 +141,7 @@ impl Store {
     // ---- chats --------------------------------------------------------------
 
     pub fn upsert_chat(&self, chat: &Chat) -> Result<(), StorageError> {
-        let bytes = bincode::serialize(chat).map_err(|e| StorageError::Encode(e.to_string()))?;
+        let bytes = bincode_serialize(chat)?;
         let write = self.inner.db.begin_write()?;
         {
             let mut chats = write.open_table(TBL_CHATS)?;
@@ -165,7 +178,7 @@ impl Store {
         let mut out = Vec::new();
         for item in chats.iter()? {
             let (_, v) = item?;
-            let chat: Chat = bincode::deserialize(v.value())?;
+            let chat: Chat = bincode_deserialize(v.value())?;
             out.push(chat);
         }
         // Newest first, pinned bubble to top.
@@ -180,7 +193,7 @@ impl Store {
     // ---- messages -----------------------------------------------------------
 
     pub fn insert_message(&self, message: &Message) -> Result<(), StorageError> {
-        let bytes = bincode::serialize(message).map_err(|e| StorageError::Encode(e.to_string()))?;
+        let bytes = bincode_serialize(message)?;
         let key = message_key(message);
         let write = self.inner.db.begin_write()?;
         {
@@ -219,7 +232,7 @@ impl Store {
         let mut out = Vec::new();
         for item in messages.range(lo.as_slice()..hi.as_slice())? {
             let (_, v) = item?;
-            out.push(bincode::deserialize::<Message>(v.value())?);
+            out.push(bincode_deserialize::<Message>(v.value())?);
         }
         Ok(out)
     }
@@ -244,7 +257,7 @@ impl Store {
         let mut count = 0u64;
         for item in table.iter()? {
             let (_, v) = item?;
-            let msg: Message = bincode::deserialize(v.value())?;
+            let msg: Message = bincode_deserialize(v.value())?;
             index.add_message(&msg)?;
             count += 1;
         }
@@ -286,6 +299,7 @@ fn message_range(chat_id: Uuid) -> (Vec<u8>, Vec<u8>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::models::{Chat, Message, Role, Settings};

@@ -11,21 +11,45 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
+/// Shared HTTP client with hardened defaults:
+/// * TLS 1.2+ enforced (TLS 1.0/1.1 are deprecated and have known weaknesses).
+/// * `https_only(true)` blocks accidental plain-HTTP downgrades.
+/// * Tight `connect_timeout` so DNS or TCP stalls fail fast instead of
+///   keeping a half-open socket around.
+/// * Overall `timeout` caps any single request — guards against a malicious
+///   or buggy server holding the stream open forever.
 pub fn http_client() -> Client {
+    #[allow(clippy::expect_used)] // Builder failure is a process-wide misconfig at startup
     Client::builder()
         .user_agent(concat!("grok-insane/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(Some(Duration::from_secs(60)))
+        .https_only(true)
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .build()
         .expect("reqwest client")
 }
 
+/// Hard cap on the in-memory buffer the SSE decoder will hold between
+/// newlines. A server that streams a single line without ever terminating
+/// would otherwise blow up RAM. 4 MiB is far more than any well-formed
+/// streaming chunk should ever reach.
+const SSE_LINE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
 /// xAI Grok chat completions client. Endpoint is OpenAI-compatible.
+///
+/// The `api_key` is wrapped in [`Zeroizing`] so that when the client is
+/// dropped the secret bytes are overwritten before the allocator can reuse
+/// them, even if a later allocation lands on the same address. This is
+/// belt-and-braces — we already store keys in the OS keyring; this layer
+/// guards process-memory dumps and core files.
 pub struct XaiClient {
     http: Client,
     base: String,
-    api_key: String,
+    api_key: Zeroizing<String>,
 }
 
 impl XaiClient {
@@ -37,7 +61,7 @@ impl XaiClient {
         Self {
             http: http_client(),
             base: base.into(),
-            api_key: api_key.into(),
+            api_key: Zeroizing::new(api_key.into()),
         }
     }
 }
@@ -79,7 +103,7 @@ impl ChatProvider for XaiClient {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.api_key))
+            HeaderValue::from_str(&format!("Bearer {}", self.api_key.as_str()))
                 .map_err(|e| ApiError::InvalidResponse(e.to_string()))?,
         );
 
@@ -157,6 +181,18 @@ impl SseDecoder {
         } else {
             // Should be unreachable for compliant providers. Drop invalid bytes.
             self.buf.push_str(&String::from_utf8_lossy(bytes));
+        }
+        // DoS guard: if the server never sends a newline we'd grow this
+        // buffer indefinitely. Trip the kill switch instead.
+        if self.buf.len() > SSE_LINE_BUDGET_BYTES {
+            tracing::warn!(
+                buf_bytes = self.buf.len(),
+                "SSE line buffer exceeded budget; ending stream"
+            );
+            self.buf.clear();
+            self.pending.push_back(ChatEvent::Done);
+            self.last_was_done = true;
+            return;
         }
         // Process every complete line.
         while let Some(idx) = self.buf.find('\n') {
@@ -260,6 +296,7 @@ struct Usage {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

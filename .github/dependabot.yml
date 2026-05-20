@@ -1,0 +1,39 @@
+# Dependabot keeps the dep graph current so we don't lag behind security
+# fixes. Weekly cadence + grouped PRs so the inbox stays sane.
+
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels: ["deps", "rust"]
+    groups:
+      patch-and-minor:
+        update-types: ["patch", "minor"]
+      major:
+        update-types: ["major"]
+    # Don't auto-bump these; they're load-bearing for the UI and need manual
+    # smoke-testing.
+    ignore:
+      - dependency-name: "eframe"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "egui"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "redb"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tantivy"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    labels: ["deps", "ci"]

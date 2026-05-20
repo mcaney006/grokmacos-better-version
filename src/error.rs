@@ -33,11 +33,8 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
 }
 
-impl From<bincode::Error> for StorageError {
-    fn from(value: bincode::Error) -> Self {
-        StorageError::Decode(value.to_string())
-    }
-}
+// bincode 2 no longer exposes a single `Error` alias; we use string-typed
+// `StorageError::Encode`/`Decode` directly at the call site instead.
 
 impl From<tantivy::TantivyError> for StorageError {
     fn from(value: tantivy::TantivyError) -> Self {

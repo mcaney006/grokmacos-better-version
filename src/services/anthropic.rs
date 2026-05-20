@@ -14,6 +14,7 @@ use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 const DEFAULT_BASE: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -21,7 +22,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub struct AnthropicClient {
     http: Client,
     base: String,
-    api_key: String,
+    api_key: Zeroizing<String>,
 }
 
 impl AnthropicClient {
@@ -29,7 +30,7 @@ impl AnthropicClient {
         Self {
             http: http_client(),
             base: DEFAULT_BASE.to_string(),
-            api_key: api_key.into(),
+            api_key: Zeroizing::new(api_key.into()),
         }
     }
 }
@@ -285,6 +286,7 @@ struct AnthropicErrorBody {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
