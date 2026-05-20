@@ -138,7 +138,9 @@ where
 
 #[derive(Default)]
 struct AnthropicDecoder {
-    buf: String,
+    // Byte-level buffer; only decode UTF-8 at line boundaries. See the
+    // identical fix in `chat.rs::SseDecoder` for full rationale.
+    buf: Vec<u8>,
     pending: std::collections::VecDeque<ChatEvent>,
     saw_stop: bool,
     input_tokens: u32,
@@ -147,17 +149,13 @@ struct AnthropicDecoder {
 
 impl AnthropicDecoder {
     fn feed(&mut self, bytes: &[u8]) {
-        if let Ok(s) = std::str::from_utf8(bytes) {
-            self.buf.push_str(s);
-        } else {
-            self.buf.push_str(&String::from_utf8_lossy(bytes));
-        }
-        while let Some(idx) = self.buf.find('\n') {
-            let mut line = self.buf[..idx].to_string();
-            self.buf.drain(..=idx);
-            if line.ends_with('\r') {
-                line.pop();
-            }
+        self.buf.extend_from_slice(bytes);
+        while let Some(idx) = self.buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = self.buf.drain(..=idx).collect();
+            let end = line_bytes
+                .len()
+                .saturating_sub(if line_bytes.ends_with(b"\r\n") { 2 } else { 1 });
+            let line = String::from_utf8_lossy(&line_bytes[..end]);
             if line.is_empty() {
                 continue;
             }

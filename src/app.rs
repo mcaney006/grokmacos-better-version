@@ -54,11 +54,19 @@ pub struct GrokApp {
     stream_started_at: Option<Instant>,
     stream_input_tokens: u32,
     stream_output_tokens: u32,
+    /// When we last persisted the in-flight streaming message to redb.
+    /// `None` means "never since the current stream started" → flush on
+    /// first delta. See `STREAM_PERSIST_DEBOUNCE` for the cadence.
+    last_stream_persist: Option<Instant>,
 
     // Voice state (audio owns !Send cpal::Streams, so it lives on the UI thread only).
     voice_audio: Option<VoiceAudio>,
     voice_session: Option<VoiceSession>,
     voice_rx: Option<UnboundedReceiver<VoiceEvent>>,
+    // One-shot delivery for the result of `VoiceSession::open(...)`. The
+    // open happens on the tokio runtime so the UI never blocks; the result
+    // lands here on completion and `drain_voice` picks it up.
+    voice_open_rx: Option<tokio::sync::oneshot::Receiver<Result<VoiceSession, ApiError>>>,
 
     // Perf
     stats: PerfStats,
@@ -71,6 +79,13 @@ pub struct GrokApp {
     // Command palette (Cmd+K)
     palette: crate::ui::palette::PaletteState,
 }
+
+/// How often we flush a streaming assistant message to redb. Smaller
+/// values reduce data loss on crash; larger values reduce I/O during
+/// streaming. 500 ms is a good middle ground — at typical 30-60 tok/s
+/// rates that's ~15-30 tokens of write amortisation, and the user
+/// experiences zero perceptible UI delay.
+const STREAM_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -120,9 +135,11 @@ impl GrokApp {
             stream_started_at: None,
             stream_input_tokens: 0,
             stream_output_tokens: 0,
+            last_stream_persist: None,
             voice_audio: None,
             voice_session: None,
             voice_rx: None,
+            voice_open_rx: None,
             stats: PerfStats::default(),
             last_frame: Instant::now(),
             frame_ema_ms: 16.0,
@@ -237,6 +254,7 @@ impl GrokApp {
         self.cancel_flag.store(false, Ordering::SeqCst);
         let cancel = self.cancel_flag.clone();
         self.stream_started_at = Some(Instant::now());
+        self.last_stream_persist = None;
         self.stream_input_tokens = 0;
         self.stream_output_tokens = 0;
 
@@ -306,12 +324,21 @@ impl GrokApp {
         while let Ok(msg) = rx.try_recv() {
             buffered.push(msg);
         }
+        // Debounce redb writes. The previous version did
+        // `store.update_message(m)` per token — at 100 tok/s that's 100
+        // ACID write transactions/sec, each re-serialising the entire
+        // growing message body via bincode. Total wall time was O(N²) in
+        // the response length. We now persist at most every
+        // STREAM_PERSIST_DEBOUNCE and force one final write on terminal
+        // events (Done / Error). Crash recovery loses at most the last
+        // ~500 ms of streamed text, which is acceptable for a chat client.
+        let mut dirty_id: Option<Uuid> = None;
         for msg in buffered {
             match msg {
                 StreamMsg::Delta(id, delta) => {
                     if let Some(m) = self.messages.iter_mut().find(|m| m.id == id) {
                         m.content.push_str(&delta);
-                        let _ = self.store.update_message(m);
+                        dirty_id = Some(id);
                     }
                 }
                 StreamMsg::Usage(_, input, output) => {
@@ -329,6 +356,7 @@ impl GrokApp {
                         let secs = (elapsed_ms.max(1) as f32) / 1000.0;
                         self.stats.tokens_per_sec = self.stream_output_tokens as f32 / secs;
                     }
+                    dirty_id = None; // already flushed above
                     should_clear = true;
                 }
                 StreamMsg::Error(id, err) => {
@@ -342,7 +370,22 @@ impl GrokApp {
                         let _ = self.store.update_message(m);
                     }
                     self.toaster.error(err);
+                    dirty_id = None;
                     should_clear = true;
+                }
+            }
+        }
+        // Debounced persistence of streamed deltas.
+        if let Some(id) = dirty_id {
+            let now = Instant::now();
+            let should_flush = self
+                .last_stream_persist
+                .map(|t| now.duration_since(t) >= STREAM_PERSIST_DEBOUNCE)
+                .unwrap_or(true);
+            if should_flush {
+                if let Some(m) = self.messages.iter().find(|m| m.id == id) {
+                    let _ = self.store.update_message(m);
+                    self.last_stream_persist = Some(now);
                 }
             }
         }
@@ -355,6 +398,35 @@ impl GrokApp {
     }
 
     fn drain_voice(&mut self) {
+        // Step 1: pick up the result of an in-flight `VoiceSession::open`
+        // if one finished since the last frame. Non-blocking; if it's not
+        // ready yet we put the receiver back and try again next frame.
+        if let Some(mut open_rx) = self.voice_open_rx.take() {
+            match open_rx.try_recv() {
+                Ok(Ok(session)) => {
+                    self.voice_session = Some(session);
+                    self.chat_view.voice_active = true;
+                }
+                Ok(Err(e)) => {
+                    self.toaster.error(format!("voice: {e}"));
+                    self.voice_audio = None;
+                    self.voice_rx = None;
+                    self.chat_view.voice_active = false;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    // Still connecting; check again next frame.
+                    self.voice_open_rx = Some(open_rx);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    // Sender dropped without sending — treat as failure.
+                    self.toaster.error("voice: connect aborted");
+                    self.voice_audio = None;
+                    self.voice_rx = None;
+                    self.chat_view.voice_active = false;
+                }
+            }
+        }
+
         let Some(mut rx) = self.voice_rx.take() else {
             return;
         };
@@ -423,8 +495,19 @@ impl GrokApp {
         if let Some(session) = self.voice_session.take() {
             session.close();
             self.voice_rx = None;
+            self.voice_open_rx = None;
             self.chat_view.voice_active = false;
             self.voice_audio = None;
+            return;
+        }
+        // If a previous toggle is mid-connect, cancel it by dropping the
+        // receiver — the spawned task's send-half will fail silently when
+        // it eventually tries to deliver.
+        if self.voice_open_rx.is_some() {
+            self.voice_open_rx = None;
+            self.voice_audio = None;
+            self.voice_rx = None;
+            self.chat_view.voice_active = false;
             return;
         }
 
@@ -453,12 +536,26 @@ impl GrokApp {
         let (forward_tx, forward_rx) = unbounded_channel::<VoiceEvent>();
         self.voice_rx = Some(forward_rx);
 
+        // Open the WebSocket on the runtime, NOT on the UI thread. The
+        // previous code called `handle.block_on(VoiceSession::open(...))`,
+        // which froze the entire eframe loop for the duration of the TCP
+        // connect + TLS handshake — up to the full 10-second timeout if the
+        // network was down. Now the UI returns immediately; the session
+        // delivers itself through `voice_open_rx`, and `drain_voice` picks
+        // it up on the next frame.
+        let (session_tx, session_rx) = tokio::sync::oneshot::channel();
+        self.voice_open_rx = Some(session_rx);
+        self.chat_view.voice_active = true; // optimistic — flipped back on failure
         let handle = self.runtime.handle().clone();
-        let open_result = handle.block_on(VoiceSession::open(api_key, persona, shared));
-        match open_result {
-            Ok(mut session) => {
+        handle.spawn(async move {
+            let outcome = VoiceSession::open(api_key, persona, shared).await;
+            let _ = session_tx.send(outcome.map(|mut session| {
+                // Forward events from the session into the UI-bound channel
+                // on the same runtime task that opened it. Spawning a
+                // separate forwarder kept the original code simpler but
+                // doubled the channel hop; in-task is fine.
                 let events_rx = std::mem::replace(&mut session.events, mpsc_dummy());
-                handle.spawn(async move {
+                tokio::spawn(async move {
                     let mut events_rx = events_rx;
                     while let Some(ev) = events_rx.recv().await {
                         if forward_tx.send(ev).is_err() {
@@ -466,15 +563,9 @@ impl GrokApp {
                         }
                     }
                 });
-                self.voice_session = Some(session);
-                self.chat_view.voice_active = true;
-            }
-            Err(e) => {
-                self.toaster.error(format!("voice: {e}"));
-                self.voice_audio = None;
-                self.voice_rx = None;
-            }
-        }
+                session
+            }));
+        });
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context, toggle_voice: &mut bool) {

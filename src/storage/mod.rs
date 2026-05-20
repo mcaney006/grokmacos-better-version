@@ -160,7 +160,7 @@ impl Store {
             let (lo, hi) = message_range(id);
             // redb requires the bounds outlive the call, so collect first.
             let to_delete: Vec<Vec<u8>> = messages
-                .range(lo.as_slice()..hi.as_slice())?
+                .range(lo.as_slice()..=hi.as_slice())?
                 .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
                 .collect();
             for key in to_delete {
@@ -230,7 +230,7 @@ impl Store {
         let messages = read.open_table(TBL_MESSAGES)?;
         let (lo, hi) = message_range(chat_id);
         let mut out = Vec::new();
-        for item in messages.range(lo.as_slice()..hi.as_slice())? {
+        for item in messages.range(lo.as_slice()..=hi.as_slice())? {
             let (_, v) = item?;
             out.push(bincode_deserialize::<Message>(v.value())?);
         }
@@ -279,22 +279,20 @@ fn message_key(msg: &Message) -> Vec<u8> {
 }
 
 fn message_range(chat_id: Uuid) -> (Vec<u8>, Vec<u8>) {
-    let mut lo = Vec::with_capacity(16);
+    // Build a 40-byte lo/hi spanning every possible key with prefix
+    // `chat_id`. Keys are `chat_id (16) || ts_be (8) || msg_id (16)`, all
+    // 40 bytes total, so:
+    //   lo = chat_id || 0x00 * 24    (smallest key with this prefix)
+    //   hi = chat_id || 0xFF * 24    (largest key with this prefix)
+    // Callers use the inclusive range `lo..=hi`, which closes the previous
+    // bug where chat_id-of-all-0xFF overflowed the carry algorithm and
+    // produced a backwards exclusive range that scanned nothing.
+    let mut lo = Vec::with_capacity(40);
     lo.extend_from_slice(chat_id.as_bytes());
-    let mut hi = lo.clone();
-    // Bump to next chat_id prefix.
-    for byte in hi.iter_mut().rev() {
-        if *byte == 0xff {
-            *byte = 0;
-        } else {
-            *byte += 1;
-            break;
-        }
-    }
-    if hi == lo {
-        // Overflowed (chat_id was all 0xff); use max sentinel.
-        hi = vec![0xff; 24];
-    }
+    lo.resize(40, 0x00);
+    let mut hi = Vec::with_capacity(40);
+    hi.extend_from_slice(chat_id.as_bytes());
+    hi.resize(40, 0xff);
     (lo, hi)
 }
 

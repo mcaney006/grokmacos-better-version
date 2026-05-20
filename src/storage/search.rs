@@ -162,8 +162,27 @@ fn snippet(body: &str, q: &str, max: usize) -> String {
     let needle = trimmed.split_whitespace().next().unwrap_or(trimmed);
     let needle_lc = needle.to_lowercase();
     if !needle_lc.is_empty() {
-        if let Some(pos) = lc_body.find(&needle_lc).or_else(|| lc_body.find(&lc_q)) {
-            // Find safe byte boundaries.
+        if let Some(pos_in_lc) = lc_body.find(&needle_lc).or_else(|| lc_body.find(&lc_q)) {
+            // `pos_in_lc` is a byte offset into the *lowercased* body. For
+            // some locales (e.g. Turkish "İ" → "i̇", German "ß" → "ss")
+            // lowercasing changes byte length, so this offset may land on a
+            // non-char-boundary in the original `body` — or worse, point
+            // past a different character than the match. The original
+            // implementation sliced `body[..pos]` directly, which would
+            // panic on those inputs.
+            //
+            // Map back by char-count: the matched byte offset in `lc_body`
+            // corresponds to some char index there; we can't always recover
+            // the exact byte position in `body`, but for the snippet
+            // rendering an approximate position is fine. Use ceil/floor to
+            // a real `body` char boundary so the slice never panics.
+            let char_count = lc_body[..pos_in_lc].chars().count();
+            let approx = body
+                .char_indices()
+                .nth(char_count)
+                .map(|(i, _)| i)
+                .unwrap_or(body.len());
+            let pos = floor_char_boundary(body, approx);
             let start = body[..pos]
                 .char_indices()
                 .rev()
@@ -174,7 +193,7 @@ fn snippet(body: &str, q: &str, max: usize) -> String {
                 .char_indices()
                 .nth(max)
                 .map(|(i, _)| pos + i)
-                .unwrap_or_else(|| body.len());
+                .unwrap_or(body.len());
             let mut s = String::new();
             if start > 0 {
                 s.push_str("… ");
@@ -187,4 +206,18 @@ fn snippet(body: &str, q: &str, max: usize) -> String {
         }
     }
     body.chars().take(max).collect()
+}
+
+/// Find the largest `i <= idx` such that `s.is_char_boundary(i)`. Slicing
+/// `s[..i]` is then guaranteed to be panic-free regardless of how `idx`
+/// was derived. `std::str::floor_char_boundary` exists as a nightly API;
+/// this is the stable in-house equivalent.
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }

@@ -342,16 +342,21 @@ fn subseq_match(hay: &str, needle: &str) -> i32 {
     if needle.is_empty() {
         return 0;
     }
+    // Walk the needle char-by-char, advancing the haystack iterator past each
+    // match. `consumed` is the count of haystack chars we've seen so far; the
+    // match position (0-based char index into `hay`) is therefore `consumed - 1`
+    // at the moment of the match — no separate `enumerate()` needed, no
+    // double-counting against `consumed`.
     let mut it = hay.chars();
     let mut last_pos: Option<usize> = None;
     let mut score: i32 = 0;
     let mut consumed = 0usize;
     for nc in needle.chars() {
         let mut matched = None;
-        for (i, hc) in it.by_ref().enumerate() {
+        for hc in it.by_ref() {
             consumed += 1;
             if hc == nc {
-                matched = Some(consumed - 1 + i);
+                matched = Some(consumed - 1);
                 break;
             }
         }

@@ -168,20 +168,21 @@ where
 
 #[derive(Default)]
 struct SseDecoder {
-    buf: String,
+    // Raw byte buffer. Previously a `String` populated via
+    // `str::from_utf8(chunk)` per network chunk, which broke catastrophically
+    // when a chunk arrived split mid-UTF-8 codepoint: `from_utf8_lossy` would
+    // replace those bytes with U+FFFD and the rest of the codepoint would
+    // arrive as orphan continuation bytes. The fix is to buffer bytes and
+    // only decode at line boundaries — `\n` is always 0x0A, never inside a
+    // multi-byte codepoint, so line splits are codepoint-safe.
+    buf: Vec<u8>,
     pending: std::collections::VecDeque<ChatEvent>,
     last_was_done: bool,
 }
 
 impl SseDecoder {
     fn feed(&mut self, bytes: &[u8]) {
-        // SSE is text/event-stream; provider chunks are UTF-8.
-        if let Ok(s) = std::str::from_utf8(bytes) {
-            self.buf.push_str(s);
-        } else {
-            // Should be unreachable for compliant providers. Drop invalid bytes.
-            self.buf.push_str(&String::from_utf8_lossy(bytes));
-        }
+        self.buf.extend_from_slice(bytes);
         // DoS guard: if the server never sends a newline we'd grow this
         // buffer indefinitely. Trip the kill switch instead.
         if self.buf.len() > SSE_LINE_BUDGET_BYTES {
@@ -194,13 +195,17 @@ impl SseDecoder {
             self.last_was_done = true;
             return;
         }
-        // Process every complete line.
-        while let Some(idx) = self.buf.find('\n') {
-            let mut line = self.buf[..idx].to_string();
-            self.buf.drain(..=idx);
-            if line.ends_with('\r') {
-                line.pop();
-            }
+        // Process every complete line. `\n` (0x0A) is an ASCII byte that
+        // cannot appear inside a multi-byte UTF-8 codepoint, so splitting
+        // on it never bisects a character — `from_utf8_lossy` per line is
+        // safe even on adversarial input.
+        while let Some(idx) = self.buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = self.buf.drain(..=idx).collect();
+            // Strip trailing \n (and \r if present) before decoding.
+            let end = line_bytes
+                .len()
+                .saturating_sub(if line_bytes.ends_with(b"\r\n") { 2 } else { 1 });
+            let line = String::from_utf8_lossy(&line_bytes[..end]);
             if line.is_empty() {
                 continue;
             }
@@ -313,5 +318,49 @@ mod tests {
         assert!(got.iter().any(|s| s.contains("hi ")));
         assert!(got.iter().any(|s| s.contains("there")));
         assert!(got.iter().any(|s| s.contains("Done")));
+    }
+
+    /// Regression: a network chunk that splits a multi-byte UTF-8 codepoint
+    /// must not corrupt the rebuilt token. Previously the decoder ran
+    /// `str::from_utf8` per chunk and fell back to `from_utf8_lossy`, which
+    /// permanently replaced the orphan continuation bytes with U+FFFD.
+    #[test]
+    fn sse_decoder_handles_utf8_split_across_chunks() {
+        let mut d = SseDecoder::default();
+        // "🎙" = 0xF0 0x9F 0x8E 0x99 (4 bytes). The full SSE line is
+        // `data: {"choices":[{"delta":{"content":"🎙"}}]}\n`. We feed it
+        // in two chunks split inside the emoji's bytes.
+        let full = b"data: {\"choices\":[{\"delta\":{\"content\":\"\xF0\x9F\x8E\x99\"}}]}\n\n";
+        let split_at = full.iter().position(|&b| b == 0xF0).map(|i| i + 2).unwrap();
+        d.feed(&full[..split_at]);
+        d.feed(&full[split_at..]);
+        let mut deltas = Vec::new();
+        while let Some(ChatEvent::Delta(s)) = d.next_event() {
+            deltas.push(s);
+        }
+        let joined = deltas.concat();
+        assert!(
+            joined.contains('\u{1F399}'),
+            "expected the emoji codepoint U+1F399, got {joined:?}"
+        );
+        assert!(
+            !joined.contains('\u{FFFD}'),
+            "decoder produced a replacement character, indicating UTF-8 was corrupted: {joined:?}"
+        );
+    }
+
+    /// Regression: a `data:` line that ends with `\r\n` (legitimate per the
+    /// SSE spec, common when servers explicitly use CRLF) was previously
+    /// fine because `line.pop()` stripped the `\r`. After moving to byte
+    /// buffering we have to keep that behaviour.
+    #[test]
+    fn sse_decoder_handles_crlf_line_endings() {
+        let mut d = SseDecoder::default();
+        d.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"crlf\"}}]}\r\n\r\n");
+        let mut deltas = Vec::new();
+        while let Some(ChatEvent::Delta(s)) = d.next_event() {
+            deltas.push(s);
+        }
+        assert_eq!(deltas, vec!["crlf"]);
     }
 }

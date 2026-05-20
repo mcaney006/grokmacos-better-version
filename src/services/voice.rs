@@ -21,6 +21,18 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 const REALTIME_URL: &str = "wss://api.x.ai/v1/realtime";
 
+/// Depth of the in-process uplink channel that buffers PCM frames between
+/// the cpal audio thread and the WebSocket sink. 16 × 24 kHz mono i16
+/// frames is well under a second of audio — large enough to absorb a
+/// brief network hiccup, small enough that we drop frames if the WS sink
+/// stalls instead of pinning RAM.
+const VOICE_UPLINK_CHANNEL_DEPTH: usize = 16;
+
+/// How often we send a WebSocket Ping. Many corporate proxies time out
+/// idle WebSockets at 60 s; pinging every 30 s keeps the path warm and
+/// gives us a clean error signal when the underlying TCP dies.
+const WS_PING_INTERVAL_SECS: u64 = 30;
+
 #[derive(Debug, Clone)]
 pub enum VoiceEvent {
     Connected,
@@ -88,13 +100,50 @@ impl VoiceSession {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
-        // Uplink: pull frames from the (Send) capture channel and push to WS.
+        // Uplink: bridge the (sync) crossbeam capture channel into a tokio
+        // mpsc, then drive the WS sink from a real `recv().await`. The
+        // previous version polled `try_recv` with a 10 ms sleep on empty —
+        // that burned CPU at 100 Hz when idle and silently fell behind the
+        // 24 kHz capture stream when busy. The bridge thread blocks on
+        // crossbeam recv (efficient), and `forward_tx.try_send` exerts
+        // proper backpressure: if the network can't keep up, frames drop
+        // at the bridge instead of growing RAM unbounded.
         let capture_rx = shared.capture_rx.clone();
+        let (forward_tx, mut forward_rx) =
+            tokio::sync::mpsc::channel::<Vec<i16>>(VOICE_UPLINK_CHANNEL_DEPTH);
+        std::thread::Builder::new()
+            .name("voice-uplink-bridge".into())
+            .spawn(move || {
+                while let Ok(frame) = capture_rx.recv() {
+                    // Best-effort: if the WS sink is backed up, drop frames
+                    // rather than queue. Voice is real-time; stale audio
+                    // helps nobody.
+                    if forward_tx.try_send(frame).is_err() {
+                        // Channel full or closed; on closed we exit, on
+                        // full we keep going so we don't lock the audio
+                        // capture thread.
+                        if forward_tx.is_closed() {
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok();
+
         let uplink_events = events_tx.clone();
         let uplink = tokio::spawn(async move {
+            // Heartbeat ticker — keeps the WS alive across stateful NATs
+            // and surfaces dead connections (the Ping send fails on a
+            // broken TCP socket, so the loop exits with an error event
+            // instead of silently sitting forever).
+            let mut heartbeat =
+                tokio::time::interval(std::time::Duration::from_secs(WS_PING_INTERVAL_SECS));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
             loop {
-                match capture_rx.try_recv() {
-                    Ok(frame) => {
+                tokio::select! {
+                    maybe_frame = forward_rx.recv() => {
+                        let Some(frame) = maybe_frame else { break; };
                         let mut bytes = Vec::with_capacity(frame.len() * 2);
                         for sample in &frame {
                             bytes.extend_from_slice(&sample.to_le_bytes());
@@ -109,10 +158,14 @@ impl VoiceSession {
                             break;
                         }
                     }
-                    Err(crossbeam_channel::TryRecvError::Empty) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    _ = heartbeat.tick() => {
+                        if let Err(e) = sink.send(WsMessage::Ping(Default::default())).await {
+                            let _ = uplink_events.send(VoiceEvent::Error(
+                                format!("ws keepalive: {e}")
+                            ));
+                            break;
+                        }
                     }
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                 }
             }
             let _ = sink.close().await;
