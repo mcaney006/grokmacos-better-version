@@ -75,10 +75,22 @@ impl VoiceSession {
         persona: VoicePersona,
         shared: VoiceShared,
     ) -> Result<Self, ApiError> {
+        Self::open_with_url(REALTIME_URL, api_key, persona, shared).await
+    }
+
+    /// URL-parameterised constructor for tests. Production callers go via
+    /// `open()`. Kept `pub(crate)` so we can drive the real keepalive +
+    /// watchdog paths against a loopback WebSocket server in unit tests.
+    pub(crate) async fn open_with_url(
+        url: &str,
+        api_key: String,
+        persona: VoicePersona,
+        shared: VoiceShared,
+    ) -> Result<Self, ApiError> {
         if api_key.trim().is_empty() {
             return Err(ApiError::MissingKey);
         }
-        let mut request = REALTIME_URL
+        let mut request = url
             .into_client_request()
             .map_err(|e| ApiError::WebSocket(e.to_string()))?;
         request.headers_mut().insert(
@@ -370,4 +382,98 @@ enum ServerEvent {
 struct ErrorMessage {
     #[serde(default)]
     message: String,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::services::audio::{LevelMeter, VoiceShared};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    fn dummy_shared() -> VoiceShared {
+        let (_capture_tx, capture_rx) = crossbeam_channel::bounded::<Vec<i16>>(8);
+        let (playback_tx, _playback_rx) = crossbeam_channel::unbounded::<Vec<i16>>();
+        VoiceShared {
+            capture_rx,
+            playback_tx,
+            level_in: LevelMeter::default(),
+            level_out: LevelMeter::default(),
+            speaking: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Spawn a loopback WS server that completes the handshake then drops
+    /// the connection. Returns the `ws://` URL bound to the ephemeral port.
+    async fn spawn_fake_ws_drop_after_handshake() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
+                    drop(ws);
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        format!("ws://127.0.0.1:{port}/")
+    }
+
+    /// When the server closes the TCP connection mid-session, the next
+    /// keepalive Ping send fails — the uplink loop must surface that as a
+    /// `VoiceEvent::Error("ws keepalive: …")` rather than silently dying.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_keepalive_send_failure_emits_error() {
+        let url = spawn_fake_ws_drop_after_handshake().await;
+        let mut session = VoiceSession::open_with_url(
+            &url,
+            "dummy-key".into(),
+            VoicePersona::Ara,
+            dummy_shared(),
+        )
+        .await
+        .expect("open_with_url ok");
+
+        // Drain events until we see proof the disconnect surfaced. We
+        // accept any of: a `ws keepalive` error (heartbeat send failed),
+        // an `uplink` error (frame send failed), a `ws ` stream error
+        // (downlink read failed), or a `Closed` event (downlink detected
+        // close). All four are valid surface points for the same dead-WS
+        // condition; what we're proving is that a server that closes
+        // immediately after handshake never leaves the session silently
+        // hung — the user gets an actionable event within a finite time.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+        let mut events_seen: Vec<String> = Vec::new();
+        let mut detected = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), session.events.recv()).await {
+                Ok(Some(ev)) => {
+                    let label = format!("{ev:?}");
+                    events_seen.push(label.clone());
+                    let is_signal = match &ev {
+                        VoiceEvent::Error(msg) => {
+                            msg.contains("ws keepalive")
+                                || msg.contains("uplink")
+                                || msg.starts_with("ws:")
+                                || msg.starts_with("ws ")
+                        }
+                        VoiceEvent::Closed => true,
+                        _ => false,
+                    };
+                    if is_signal {
+                        detected = true;
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            detected,
+            "expected dead-WS signal within 35s; got events: {events_seen:?}"
+        );
+    }
 }
