@@ -76,3 +76,48 @@ jobs:
           shared-key: machete
       - name: hygiene
         run: cargo xtask ci --stage hygiene
+
+  # cargo-vet — cryptographically attested human review of every transitive
+  # dep. Complementary to cargo-audit (CVEs) and cargo-deny (licenses): vet
+  # answers "did a trusted human read this version of this crate's source?"
+  # by importing audits from Mozilla / Google / Embark / Bytecode Alliance.
+  #
+  # On first run, `cargo vet check` will list every unaudited dep. The
+  # `continue-on-error: true` keeps the workflow green while the audit
+  # baseline catches up — flip it off once `supply-chain/audits.toml` is
+  # populated. Output is preserved in the job summary either way.
+  cargo-vet:
+    name: cargo-vet (audited dependency provenance)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: "1.94.0"
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          shared-key: vet
+      - name: install cargo-vet
+        uses: taiki-e/install-action@4dc6d6f7daccba8c25b95878f1d5cf1c1ca77ca5  # v2
+        with:
+          tool: cargo-vet
+      - name: vet (informational)
+        continue-on-error: true
+        run: |
+          if [ ! -f supply-chain/config.toml ]; then
+            echo "no supply-chain/config.toml yet; running 'cargo vet init' to scaffold."
+            cargo vet init --no-registry-suggestions || true
+          fi
+          cargo vet check --locked 2>&1 | tee vet-output.txt
+      - name: post output to summary
+        if: always()
+        run: |
+          {
+            echo "## cargo-vet"
+            echo ""
+            echo '```'
+            cat vet-output.txt 2>/dev/null || echo "(no vet output captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

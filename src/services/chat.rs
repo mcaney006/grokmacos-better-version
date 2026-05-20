@@ -491,6 +491,42 @@ mod tests {
         assert!(rendered.contains("req-123"), "got {rendered}");
     }
 
+    /// Regression: an adversarial server that interleaves empty `Bytes`
+    /// chunks must not confuse the decoder. reqwest's `bytes_stream()` can
+    /// surface zero-length chunks legitimately (heartbeat slices, TLS
+    /// record boundaries) and a naive decoder that special-cased "len > 0"
+    /// would drop subsequent real data.
+    #[test]
+    fn sse_decoder_handles_zero_byte_chunks() {
+        let mut d = SseDecoder::new(None);
+        // Real payload chopped fine + zero-byte chunks scattered throughout.
+        let pieces: &[&[u8]] = &[
+            b"",
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"a",
+            b"",
+            b"",
+            b"lpha\"}}]}\n",
+            b"",
+            b"\n",
+            b"",
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"beta\"}}]}\n\n",
+            b"",
+            b"data: [DONE]\n\n",
+            b"",
+        ];
+        for p in pieces {
+            d.feed(p);
+        }
+        let deltas: Vec<String> = collect_ok(&mut d)
+            .into_iter()
+            .filter_map(|e| match e {
+                ChatEvent::Delta(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.concat(), "alphabeta");
+    }
+
     /// Regression: persistent JSON parse failures surface as a
     /// `ProviderStream` error after `SSE_PARSE_FAILURE_LIMIT` strikes
     /// instead of silently swallowing forever.

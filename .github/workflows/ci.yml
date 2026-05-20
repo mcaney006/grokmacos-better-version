@@ -54,6 +54,14 @@ jobs:
           shared-key: ci-${{ runner.os }}-${{ runner.arch }}
           cache-on-failure: false
 
+      # cargo-nextest replaces `cargo test` with a process-per-test runner
+      # that's ~3x faster on this graph and surfaces hung tests cleanly.
+      # Installed from prebuilt binaries — no source compile, no nightly.
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@4dc6d6f7daccba8c25b95878f1d5cf1c1ca77ca5  # v2
+        with:
+          tool: nextest
+
       # --- All step bodies below are the same: `cargo xtask ci --stage X`.
       # The xtask binary handles the GHA-specific output, the step summary,
       # and the telemetry. YAML stays declarative.
@@ -68,8 +76,8 @@ jobs:
       - name: clippy
         run: cargo xtask ci --stage clippy
 
-      - name: test
-        run: cargo xtask ci --stage test
+      - name: nextest
+        run: cargo xtask ci --stage nextest
 
       - name: build
         run: cargo xtask ci --stage build

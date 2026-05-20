@@ -15,6 +15,8 @@ use crate::services::audio::VoiceShared;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -32,6 +34,22 @@ const VOICE_UPLINK_CHANNEL_DEPTH: usize = 16;
 /// idle WebSockets at 60 s; pinging every 30 s keeps the path warm and
 /// gives us a clean error signal when the underlying TCP dies.
 const WS_PING_INTERVAL_SECS: u64 = 30;
+
+/// Receive-side watchdog cadence. Every 60 s we check `last_recv`; if the
+/// last message was older than `WS_RECV_DEADLINE_SECS` we declare the
+/// connection dead and emit an Error event. A send-only health check
+/// (Ping/Pong) catches only one half of a half-open TCP — the watchdog
+/// is the other half: silent receive-side hangs (network partition,
+/// upstream load balancer eating frames) get a finite-time error.
+const WS_RECV_WATCHDOG_INTERVAL_SECS: u64 = 60;
+const WS_RECV_DEADLINE_SECS: i64 = 90;
+
+fn epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone)]
 pub enum VoiceEvent {
@@ -171,15 +189,49 @@ impl VoiceSession {
             let _ = sink.close().await;
         });
 
+        // Receive watchdog: shared timestamp updated on every server frame
+        // (text/binary/pong/ping/close — anything that proves the upstream
+        // is alive). A separate task wakes every 60 s, compares against
+        // `WS_RECV_DEADLINE_SECS`, and surfaces an error if the gap is too
+        // wide. The watchdog itself never decides "fail loud"; it always
+        // emits an error event so the UI can react.
+        let last_recv = Arc::new(AtomicI64::new(epoch_secs()));
+        let watchdog_recv = last_recv.clone();
+        let watchdog_events = events_tx.clone();
+        let watchdog = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                WS_RECV_WATCHDOG_INTERVAL_SECS,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // First tick fires immediately; skip it so we don't false-alarm
+            // before any frame has had a chance to arrive.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let now = epoch_secs();
+                let last = watchdog_recv.load(Ordering::Relaxed);
+                if now - last > WS_RECV_DEADLINE_SECS {
+                    let _ = watchdog_events.send(VoiceEvent::Error(format!(
+                        "ws receive watchdog: no frames for {}s (deadline {}s)",
+                        now - last,
+                        WS_RECV_DEADLINE_SECS
+                    )));
+                    break;
+                }
+            }
+        });
+
         // Downlink: decode JSON frames + ferry events to UI / audio.
         let playback_tx = shared.playback_tx.clone();
         let downlink_events = events_tx.clone();
+        let downlink_recv = last_recv.clone();
         tokio::spawn(async move {
             let _ = downlink_events.send(VoiceEvent::Connected);
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
                     msg = stream.next() => {
+                        downlink_recv.store(epoch_secs(), Ordering::Relaxed);
                         match msg {
                             Some(Ok(WsMessage::Text(text))) => {
                                 match serde_json::from_str::<ServerEvent>(&text) {
@@ -204,6 +256,7 @@ impl VoiceSession {
                 }
             }
             uplink.abort();
+            watchdog.abort();
             let _ = downlink_events.send(VoiceEvent::Closed);
         });
 
