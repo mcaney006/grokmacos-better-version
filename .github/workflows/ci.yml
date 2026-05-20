@@ -37,9 +37,12 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
 
       - name: Install Rust
+        # Toolchain version is pinned to match rust-toolchain.toml exactly,
+        # so the runners can't accidentally float onto a newer stable that
+        # introduces new clippy lints under our `-D warnings` policy.
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
-          toolchain: stable
+          toolchain: "1.94.0"
           components: rustfmt, clippy
 
       # Rust-specific caching. Replaces actions/cache@v4 which targets Node

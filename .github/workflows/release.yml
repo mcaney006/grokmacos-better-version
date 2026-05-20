@@ -57,8 +57,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
-          # rust-toolchain.toml drives the actual channel; this line just adds
-          # the cross-compile target for this matrix entry.
+          toolchain: "1.94.0"
           targets: ${{ matrix.triple }}
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
