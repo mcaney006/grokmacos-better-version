@@ -5,32 +5,30 @@ on:
     branches: [main, master]
   pull_request:
 
+# Cancel in-flight runs for the same ref when a new commit lands.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
 jobs:
   build:
-    name: build & test
+    name: ${{ matrix.label }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+          - { os: ubuntu-latest,  label: "linux (x86_64)" }
+          - { os: macos-latest,   label: "macos (arm64)" }
+          - { os: windows-latest, label: "windows (x86_64)" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux audio + UI deps
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libfontconfig1-dev
-
-      - name: Install rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -44,15 +42,22 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
-      - name: Format
-        run: cargo fmt --all -- --check
+      - name: Install OS dev deps (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo xtask install-deps
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Full check (fmt + clippy + test)
+        run: cargo xtask check
 
-      - name: Build
-        run: cargo build --verbose
+      - name: Release build
+        run: cargo xtask dist
 
-      - name: Test
-        run: cargo test --verbose
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-insane-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: ignore

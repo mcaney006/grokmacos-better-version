@@ -1,10 +1,21 @@
-[package]
-name = "grok-insane"
+[workspace]
+members = [".", "xtask"]
+default-members = ["."]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
-description = "Cross-platform high-performance desktop client for xAI Grok with voice, search, and multi-provider support."
 license = "MIT OR Apache-2.0"
+
+[package]
+name = "grok-insane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cross-platform high-performance desktop client for xAI Grok with voice, search, and multi-provider support."
 publish = false
 
 [[bin]]
