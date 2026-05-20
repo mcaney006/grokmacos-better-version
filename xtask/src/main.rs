@@ -8,15 +8,19 @@
 //! * `test`           — `cargo test --all`
 //! * `dev`            — `cargo run` with verbose logs enabled
 //! * `dist`           — release build, strip symbols, copy to `dist/<target>/`
-//! * `bundle`         — per-OS bundle (`.app` / `.exe` zip / `.tar.gz`) in `dist/`
+//! * `bundle`         — per-OS bundle (`.app` / `.exe` / staged dir) in `dist/`
+//! * `sign`           — macOS only: hardened-runtime codesign with Developer ID
+//! * `notarize`       — macOS only: submit + wait + staple via `xcrun notarytool`
+//! * `dmg`            — macOS only: end-to-end `.app` -> signed -> notarized -> DMG
 //! * `reset`          — wipe local app data via `grok-insane --reset-db --yes`
 //! * `install-deps`   — install OS dev libs (Linux apt-get only)
 //! * `ci`             — what CI runs: install-deps + check + dist
 //! * `clean`          — `cargo clean` + remove `dist/`
 //! * `help`           — print usage
 //!
-//! Everything is pure Rust + `std::process::Command` so there is exactly zero
-//! shell in this repo.
+//! Everything is pure Rust + `std::process::Command`. macOS packaging shells
+//! out to system binaries (`codesign`, `hdiutil`, `xcrun notarytool`,
+//! `xcrun stapler`) — those are Apple's tools, not third-party shell scripts.
 
 use anyhow::{bail, Context, Result};
 use std::env;
@@ -42,6 +46,9 @@ fn run() -> Result<()> {
         "dev" => dev(&rest),
         "dist" => dist(),
         "bundle" => bundle(),
+        "sign" => sign(),
+        "notarize" => notarize(),
+        "dmg" => dmg(),
         "reset" => reset(),
         "install-deps" => install_deps(),
         "ci" => ci(),
@@ -67,7 +74,10 @@ fn print_help() {
     println!("  test          cargo test --all");
     println!("  dev [args]    cargo run with debug logging (forwards extra args)");
     println!("  dist          cargo build --release, strip, copy to dist/<target>/");
-    println!("  bundle        per-OS bundle in dist/  (.app / zip / tar.gz)");
+    println!("  bundle        per-OS bundle in dist/  (.app / .exe / staged dir)");
+    println!("  sign          macOS: codesign --options runtime --timestamp with Developer ID");
+    println!("  notarize      macOS: xcrun notarytool submit --wait + stapler");
+    println!("  dmg           macOS: bundle -> sign -> notarize -> staple -> .dmg in dist/");
     println!("  reset         wipe local app data");
     println!("  install-deps  install OS dev libs (Linux apt only)");
     println!("  ci            install-deps + check + dist");
@@ -187,6 +197,237 @@ fn bundle() -> Result<()> {
     }
 
     Ok(())
+}
+
+// --- macOS signing / notarization / DMG ------------------------------------
+//
+// These steps only do real work on macOS hosts. On other platforms they print
+// a notice and return so CI matrices don't fail unexpectedly.
+//
+// Required environment variables (set as repository secrets in CI):
+//
+//   APPLE_DEVELOPER_ID_APPLICATION   "Developer ID Application: Your Name (TEAMID)"
+//   APPLE_ID                         your-apple-id@example.com
+//   APPLE_TEAM_ID                    10-char team identifier (e.g. ABCDE12345)
+//   APPLE_APP_SPECIFIC_PASSWORD      app-specific password for notarytool
+//
+// Without these, we sign with an ad-hoc signature (still passes Gatekeeper's
+// quarantine path for self-distribution but Mac users will see "unknown
+// developer" on first open). Signed + notarized is the only way to get a
+// silent open and to maximise SentinelOne trust.
+
+#[cfg(not(target_os = "macos"))]
+fn sign() -> Result<()> {
+    println!("sign: macOS-only step; skipping on this host.");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn sign() -> Result<()> {
+    {
+        bundle()?;
+        let app = mac_app_path();
+        if !app.exists() {
+            bail!(
+                "expected .app at {} — run `cargo xtask bundle` first",
+                app.display()
+            );
+        }
+        let entitlements = workspace_root()
+            .join("packaging")
+            .join("Entitlements.plist");
+        if !entitlements.exists() {
+            bail!("missing entitlements at {}", entitlements.display());
+        }
+        let identity = env::var("APPLE_DEVELOPER_ID_APPLICATION").ok();
+
+        let mut cmd = Command::new("codesign");
+        cmd.arg("--force")
+            .arg("--deep")
+            .arg("--options")
+            .arg("runtime")
+            .arg("--timestamp")
+            .arg("--entitlements")
+            .arg(&entitlements);
+        match identity.as_deref() {
+            Some(id) if !id.is_empty() => {
+                cmd.arg("--sign").arg(id);
+                println!("sign: codesigning with `{id}`");
+            }
+            _ => {
+                cmd.arg("--sign").arg("-");
+                eprintln!(
+                    "sign: APPLE_DEVELOPER_ID_APPLICATION not set — using ad-hoc signature.\n\
+                     The resulting .app will trigger Gatekeeper warnings on other Macs."
+                );
+            }
+        }
+        cmd.arg(&app);
+        run_cmd(&mut cmd)?;
+
+        // Quick verification so failures are caught here, not at Gatekeeper time.
+        let mut verify = Command::new("codesign");
+        verify
+            .arg("--verify")
+            .arg("--deep")
+            .arg("--strict")
+            .arg("--verbose=2")
+            .arg(&app);
+        run_cmd(&mut verify)?;
+
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn notarize() -> Result<()> {
+    println!("notarize: macOS-only step; skipping on this host.");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn notarize() -> Result<()> {
+    {
+        let app = mac_app_path();
+        if !app.exists() {
+            bail!("missing .app at {}", app.display());
+        }
+        let apple_id =
+            env::var("APPLE_ID").context("APPLE_ID env var required for notarization")?;
+        let team_id =
+            env::var("APPLE_TEAM_ID").context("APPLE_TEAM_ID env var required for notarization")?;
+        let password = env::var("APPLE_APP_SPECIFIC_PASSWORD")
+            .context("APPLE_APP_SPECIFIC_PASSWORD env var required for notarization")?;
+
+        // notarytool requires a zip or a dmg; submit a zip of the .app so we
+        // can keep the DMG step independent.
+        let out_dir = workspace_root().join("dist").join(host_target_triple());
+        let zip = out_dir.join("GrokInsane.zip");
+        let mut z = Command::new("ditto");
+        z.arg("-c")
+            .arg("-k")
+            .arg("--keepParent")
+            .arg(&app)
+            .arg(&zip);
+        run_cmd(&mut z)?;
+
+        let mut sub = Command::new("xcrun");
+        sub.arg("notarytool")
+            .arg("submit")
+            .arg(&zip)
+            .arg("--apple-id")
+            .arg(&apple_id)
+            .arg("--team-id")
+            .arg(&team_id)
+            .arg("--password")
+            .arg(&password)
+            .arg("--wait");
+        run_cmd(&mut sub)?;
+
+        // Staple the ticket so the bundle works offline.
+        let mut staple = Command::new("xcrun");
+        staple.arg("stapler").arg("staple").arg(&app);
+        run_cmd(&mut staple)?;
+
+        // Final assessment — what Gatekeeper will do.
+        let mut assess = Command::new("spctl");
+        assess
+            .arg("-a")
+            .arg("-vvv")
+            .arg("--type")
+            .arg("execute")
+            .arg(&app);
+        run_cmd(&mut assess)?;
+
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dmg() -> Result<()> {
+    println!("dmg: macOS-only step; skipping on this host.");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn dmg() -> Result<()> {
+    {
+        sign()?;
+        // Notarisation is optional locally; CI will provide the env vars.
+        if env::var("APPLE_ID").is_ok() && env::var("APPLE_APP_SPECIFIC_PASSWORD").is_ok() {
+            notarize()?;
+        } else {
+            println!("dmg: notary creds absent, skipping notarization step.");
+        }
+
+        let out_dir = workspace_root().join("dist").join(host_target_triple());
+        let app = mac_app_path();
+        let dmg_path = out_dir.join(format!("GrokInsane-{}.dmg", env!("CARGO_PKG_VERSION")));
+        if dmg_path.exists() {
+            std::fs::remove_file(&dmg_path).ok();
+        }
+
+        // Stage the .app + a /Applications symlink inside a temp dir so the
+        // resulting DMG has the classic "drag to Applications" layout.
+        let stage = out_dir.join("dmg-stage");
+        if stage.exists() {
+            std::fs::remove_dir_all(&stage).ok();
+        }
+        std::fs::create_dir_all(&stage)?;
+        let mut cp = Command::new("ditto");
+        cp.arg(&app).arg(stage.join("GrokInsane.app"));
+        run_cmd(&mut cp)?;
+        let mut ln = Command::new("ln");
+        ln.arg("-s")
+            .arg("/Applications")
+            .arg(stage.join("Applications"));
+        run_cmd(&mut ln)?;
+
+        // Build the DMG with hdiutil (Apple's own tool, ships with macOS).
+        let mut create = Command::new("hdiutil");
+        create
+            .arg("create")
+            .arg("-volname")
+            .arg("GrokInsane")
+            .arg("-srcfolder")
+            .arg(&stage)
+            .arg("-ov")
+            .arg("-format")
+            .arg("UDZO")
+            .arg(&dmg_path);
+        run_cmd(&mut create)?;
+
+        // Sign the DMG itself so Gatekeeper trusts the container.
+        if let Ok(id) = env::var("APPLE_DEVELOPER_ID_APPLICATION") {
+            if !id.is_empty() {
+                let mut sign = Command::new("codesign");
+                sign.arg("--sign")
+                    .arg(&id)
+                    .arg("--timestamp")
+                    .arg(&dmg_path);
+                run_cmd(&mut sign)?;
+            }
+        }
+
+        // Staple the DMG too (the .app inside is already stapled, but stapling
+        // the outer container lets Finder skip a network check on first open).
+        if env::var("APPLE_ID").is_ok() {
+            let mut staple = Command::new("xcrun");
+            staple.arg("stapler").arg("staple").arg(&dmg_path);
+            let _ = staple.status();
+        }
+
+        println!("dmg: {}", dmg_path.display());
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_app_path() -> PathBuf {
+    workspace_root()
+        .join("dist")
+        .join(host_target_triple())
+        .join("GrokInsane.app")
 }
 
 fn reset() -> Result<()> {

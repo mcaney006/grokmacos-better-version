@@ -344,6 +344,76 @@ cargo build --release --features plugins
 
 ---
 
+## Releases (macOS DMG with Apple signing + notarization)
+
+A tag push (`v0.1.0` and up) drives `.github/workflows/release.yml`, which:
+
+1. Builds release binaries on macOS arm64, macOS x86_64, Linux x86_64, and
+   Windows x86_64.
+2. On macOS, imports your Developer ID certificate into an ephemeral keychain
+   and runs `cargo xtask dmg` — which calls `codesign --options runtime
+   --timestamp --entitlements packaging/Entitlements.plist`, submits to
+   `xcrun notarytool submit --wait`, staples with `xcrun stapler staple`, and
+   builds the DMG with `hdiutil`. Both the `.app` and the `.dmg` itself are
+   signed and stapled.
+3. Uploads `grok-insane-<version>-<triple>.dmg` / `.tar.gz` / `.zip` to a
+   GitHub Release using `softprops/action-gh-release`.
+
+### Required repository secrets
+
+Add these in **Settings → Secrets and variables → Actions** before tagging:
+
+| Secret | What it is |
+|---|---|
+| `APPLE_CERTIFICATE_P12_BASE64` | Your `Developer ID Application` cert exported as `.p12`, then `base64 -i cert.p12 \| pbcopy`. |
+| `APPLE_CERTIFICATE_PASSWORD`   | The password you set when exporting the `.p12`. |
+| `APPLE_DEVELOPER_ID_APPLICATION` | The full identity string, e.g. `Developer ID Application: Your Name (TEAMID12345)`. Get it with `security find-identity -v -p codesigning`. |
+| `APPLE_ID`                     | Your Apple ID email. |
+| `APPLE_TEAM_ID`                | The 10-char Team ID from your Apple Developer account. |
+| `APPLE_APP_SPECIFIC_PASSWORD`  | Generate at <https://appleid.apple.com> → Sign-in & Security → App-Specific Passwords. |
+| `KEYCHAIN_PASSWORD`            | Any long random string. Used only to lock the temporary keychain on the runner. |
+
+### What Gatekeeper, XProtect, and SentinelOne will see
+
+| State | First-launch behaviour |
+|---|---|
+| Signed **and** notarized (all secrets present) | DMG opens cleanly. The `.app` opens with no warnings. Gatekeeper + XProtect verify the stapled ticket offline; SentinelOne sees a trusted Apple-notarized binary with a known Team ID. |
+| Signed only (no notary creds) | Gatekeeper shows "X cannot be opened because Apple cannot check it for malicious software." User can right-click → Open as the escape hatch. |
+| Ad-hoc signed (no Apple secrets) | Gatekeeper blocks the app outright on first launch; same right-click escape hatch. SentinelOne will frequently flag and quarantine. |
+
+Note that **no client-side change can guarantee SentinelOne won't flag the
+binary** — S1 runs behavioural rules set by your IT admin. A notarized binary
+from a known Team ID is the strongest signal you can ship; if S1 still flags
+it, the only fix is for an admin to add an exclusion.
+
+To cut a release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+# CI takes a few minutes; the release appears under
+# https://github.com/<you>/<repo>/releases
+```
+
+You can also kick off the workflow manually under **Actions → Release → Run
+workflow** (it'll build but won't publish a release unless triggered by a tag).
+
+### Building a DMG locally on macOS
+
+```bash
+# ad-hoc signed (warns at launch but works for local testing):
+cargo xtask dmg
+
+# fully signed + notarized:
+export APPLE_DEVELOPER_ID_APPLICATION="Developer ID Application: Your Name (TEAMID12345)"
+export APPLE_ID="you@example.com"
+export APPLE_TEAM_ID="TEAMID12345"
+export APPLE_APP_SPECIFIC_PASSWORD="xxxx-xxxx-xxxx-xxxx"
+cargo xtask dmg
+```
+
+The output lands at `dist/<host-triple>/GrokInsane-<version>.dmg`.
+
 ## Security Model
 
 - **Secrets** never touch disk in plaintext. API keys live in the OS keyring

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Entitlements for the hardened runtime. Anything not granted here is
+        denied. We grant only what the app actually needs so static analysers
+        (Gatekeeper, SentinelOne behavioural rules, XProtect) see a tightly
+        sandboxed binary.
+    -->
+
+    <!-- Microphone capture for voice mode. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- Allow outbound network for chat/voice APIs. -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!--
+        Hardened runtime requires these to be explicit. We do not load
+        external plugins or executables by default — flip these only if the
+        WebAssembly plugin feature is enabled and you ship plugins.
+    -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <false/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <false/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <false/>
+    <key>com.apple.security.cs.disable-executable-page-protection</key>
+    <false/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <false/>
+</dict>
+</plist>

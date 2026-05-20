@@ -1,0 +1,163 @@
+name: Release
+
+# Cuts a GitHub Release with signed + notarized macOS DMG (and platform
+# binaries for Linux + Windows) when you push a tag like `v0.1.0`.
+#
+# Required repository secrets for full macOS code-signing + notarization:
+#
+#   APPLE_CERTIFICATE_P12_BASE64   base64-encoded .p12 of the Developer ID Application cert
+#   APPLE_CERTIFICATE_PASSWORD     password used when exporting the .p12
+#   APPLE_DEVELOPER_ID_APPLICATION "Developer ID Application: Your Name (TEAMID)"
+#   APPLE_ID                       your apple id email
+#   APPLE_TEAM_ID                  your 10-char Team ID
+#   APPLE_APP_SPECIFIC_PASSWORD    app-specific password generated at appleid.apple.com
+#   KEYCHAIN_PASSWORD              any random string used to lock the ephemeral keychain
+#
+# If any Apple secret is missing the macOS build still runs but produces an
+# ad-hoc-signed DMG. Gatekeeper will warn on that build; only a notarized DMG
+# opens silently and maximises trust under SentinelOne/XProtect.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.0). Leave blank for ad-hoc draft."
+        required: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  build:
+    name: build ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,        label: "macOS (arm64)",   triple: "aarch64-apple-darwin",      artifact: "dmg" }
+          - { os: macos-13,        label: "macOS (x86_64)",  triple: "x86_64-apple-darwin",       artifact: "dmg" }
+          - { os: ubuntu-latest,   label: "Linux (x86_64)",  triple: "x86_64-unknown-linux-gnu",  artifact: "tar.gz" }
+          - { os: windows-latest,  label: "Windows (x86_64)",triple: "x86_64-pc-windows-msvc",    artifact: "zip" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.triple }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install Linux deps
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo xtask install-deps
+
+      # --- macOS: import codesigning cert into an ephemeral keychain --------
+      - name: Set up macOS keychain
+        if: startsWith(matrix.os, 'macos') && env.APPLE_CERTIFICATE_P12_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD:    ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD:             ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/cert.p12" \
+              -P "$APPLE_CERTIFICATE_PASSWORD" \
+              -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+          rm "$RUNNER_TEMP/cert.p12"
+
+      # --- Build ------------------------------------------------------------
+      - name: Release build (non-macOS)
+        if: ${{ !startsWith(matrix.os, 'macos') }}
+        run: cargo build --release --target ${{ matrix.triple }} --locked
+
+      - name: Build + sign + notarize + DMG (macOS)
+        if: startsWith(matrix.os, 'macos')
+        env:
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
+          APPLE_ID:                       ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID:                  ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD:    ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: cargo xtask dmg
+
+      # --- Stage artifacts --------------------------------------------------
+      - name: Stage Linux tarball
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          OUT="dist/${{ matrix.triple }}"
+          mkdir -p "$OUT"
+          cp "target/${{ matrix.triple }}/release/grok-insane" "$OUT/grok-insane"
+          cp README.md "$OUT/" || true
+          tar -C dist -czf "$OUT/grok-insane-${GITHUB_REF_NAME:-dev}-${{ matrix.triple }}.tar.gz" \
+              "${{ matrix.triple }}"
+          ls -la "$OUT/"
+
+      - name: Stage Windows zip
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $out = "dist\${{ matrix.triple }}"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          Copy-Item "target\${{ matrix.triple }}\release\grok-insane.exe" "$out\grok-insane.exe"
+          Compress-Archive -Path "$out\grok-insane.exe" `
+                           -DestinationPath "$out\grok-insane-${{ github.ref_name }}-${{ matrix.triple }}.zip" `
+                           -Force
+
+      # --- Upload per-OS artifact ------------------------------------------
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grok-insane-${{ matrix.triple }}
+          path: |
+            dist/${{ matrix.triple }}/*.dmg
+            dist/${{ matrix.triple }}/*.tar.gz
+            dist/${{ matrix.triple }}/*.zip
+          if-no-files-found: warn
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -laR artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: GrokInsane ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: |
+            artifacts/**/*.dmg
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
