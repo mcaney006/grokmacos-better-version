@@ -232,7 +232,11 @@ fn render_composer(ui: &mut Ui, state: &mut ChatViewState, action: &mut ChatActi
                 }
 
                 ui.vertical(|ui| {
-                    let mic_label = if state.voice_active { "■" } else { "🎙" };
+                    let mic_label = if state.voice_active {
+                        egui_phosphor::regular::STOP_CIRCLE
+                    } else {
+                        egui_phosphor::regular::MICROPHONE
+                    };
                     if ui
                         .add_sized(
                             [38.0, 32.0],
@@ -250,7 +254,11 @@ fn render_composer(ui: &mut Ui, state: &mut ChatViewState, action: &mut ChatActi
                         action.toggle_voice = true;
                     }
 
-                    let tts_label = if state.tts_enabled { "🔊" } else { "🔇" };
+                    let tts_label = if state.tts_enabled {
+                        egui_phosphor::regular::SPEAKER_HIGH
+                    } else {
+                        egui_phosphor::regular::SPEAKER_SLASH
+                    };
                     if ui
                         .add_sized(
                             [38.0, 32.0],
@@ -272,9 +280,12 @@ fn render_composer(ui: &mut Ui, state: &mut ChatViewState, action: &mut ChatActi
                         if ui
                             .add_sized(
                                 [38.0, 32.0],
-                                egui::Button::new(RichText::new("⏹").color(Color32::WHITE))
-                                    .fill(Color32::from_rgb(120, 60, 60))
-                                    .corner_radius(8),
+                                egui::Button::new(
+                                    RichText::new(egui_phosphor::regular::STOP)
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(120, 60, 60))
+                                .corner_radius(8),
                             )
                             .on_hover_text("Stop generation (⌘.)")
                             .clicked()
@@ -284,9 +295,12 @@ fn render_composer(ui: &mut Ui, state: &mut ChatViewState, action: &mut ChatActi
                     } else if ui
                         .add_sized(
                             [38.0, 32.0],
-                            egui::Button::new(RichText::new("➤").color(Color32::WHITE))
-                                .fill(theme::ACCENT.gamma_multiply(0.4))
-                                .corner_radius(8),
+                            egui::Button::new(
+                                RichText::new(egui_phosphor::regular::PAPER_PLANE_RIGHT)
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(theme::ACCENT.gamma_multiply(0.4))
+                            .corner_radius(8),
                         )
                         .on_hover_text("Send (⏎)")
                         .clicked()

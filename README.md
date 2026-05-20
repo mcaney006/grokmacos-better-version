@@ -39,7 +39,10 @@ with the same code.
 | Area | What you get |
 |---|---|
 | **Providers** | xAI Grok (streaming) · OpenAI (streaming, shared decoder) · Anthropic (native Messages SSE w/ usage) · any local OpenAI-compatible endpoint (Ollama, LM Studio, llama.cpp server) |
-| **Chat UI** | Multi-chat sidebar, full transcript history, sticky-to-bottom auto-scroll, virtualised scroll, Markdown rendering with code blocks via `egui_commonmark`, copy-message, ↻ regenerate |
+| **Chat UI** | Multi-chat sidebar, full transcript history, sticky-to-bottom auto-scroll, virtualised scroll, Markdown rendering with **syntax-highlighted** code blocks (`egui_commonmark` + `syntect`), copy-message, ↻ regenerate |
+| **Command palette** | <kbd>⌘ / Ctrl</kbd>+<kbd>K</kbd> opens a fuzzy launcher for every action: new chat · settings · voice/TTS/RAG · theme · provider · jump-to-chat · export · quit |
+| **Phosphor icons** | Bundled `egui-phosphor` icon font; toolbar buttons render real glyphs (microphone, speaker, paper-plane) on every platform |
+| **Real RAM tracking** | Perf dashboard reads resident memory from `sysinfo` once per second — actual process RSS, not a guess |
 | **Chat management** | Pin · archive · rename · delete · export to Markdown / Obsidian / JSON from a right-click menu |
 | **Voice** | Realtime WebSocket to `wss://api.x.ai/v1/realtime`, full duplex audio via `cpal`, custom animated waveform, persona selector (Ara / Rex / Sal / Eve / Leo), client-side level metering, server-side VAD |
 | **Search** | Every message indexed by `tantivy`; instant full-text + fuzzy queries even at 100k+ messages |
@@ -159,6 +162,7 @@ Run `grok-insane --diag` for the exact paths on your machine.
 | <kbd>⌘ / Ctrl</kbd>+<kbd>N</kbd> | New chat |
 | <kbd>⌘ / Ctrl</kbd>+<kbd>,</kbd> | Toggle Settings |
 | <kbd>⌘ / Ctrl</kbd>+<kbd>.</kbd> | Stop generation |
+| <kbd>⌘ / Ctrl</kbd>+<kbd>K</kbd> | **Command palette** (fuzzy launcher) |
 | <kbd>⌘ / Ctrl</kbd>+<kbd>⇧</kbd>+<kbd>V</kbd> | Toggle voice mode |
 | <kbd>Enter</kbd> | Send |
 | <kbd>⇧</kbd>+<kbd>Enter</kbd> | Newline in composer |
@@ -276,6 +280,13 @@ in the `xtask/` crate and are invoked with `cargo xtask <command>`.
 | `cargo xtask ci` | `install-deps` + `check` + `dist`. |
 | `cargo xtask clean` | `cargo clean` + remove `dist/`. |
 | `cargo xtask help` | Print the above. |
+
+### Command palette (⌘/Ctrl+K)
+
+Press <kbd>⌘ / Ctrl</kbd>+<kbd>K</kbd> from anywhere in the app to open the
+command palette. Fuzzy-matches against every action — new chat, settings,
+voice/TTS/RAG toggles, theme + provider switches, "go to chat" by title,
+export, quit. Arrow keys + <kbd>Enter</kbd> to run, <kbd>Esc</kbd> to close.
 
 Add a new helper by editing [`xtask/src/main.rs`](xtask/src/main.rs); each
 helper is a regular Rust function calling `std::process::Command`.

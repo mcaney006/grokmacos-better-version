@@ -26,6 +26,7 @@ use crate::ui::toast::Toaster;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
@@ -63,6 +64,12 @@ pub struct GrokApp {
     stats: PerfStats,
     last_frame: Instant,
     frame_ema_ms: f32,
+    sys: System,
+    pid: Pid,
+    last_mem_refresh: Instant,
+
+    // Command palette (Cmd+K)
+    palette: crate::ui::palette::PaletteState,
 }
 
 #[derive(Debug)]
@@ -119,6 +126,12 @@ impl GrokApp {
             stats: PerfStats::default(),
             last_frame: Instant::now(),
             frame_ema_ms: 16.0,
+            sys: System::new_with_specifics(
+                RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
+            ),
+            pid: Pid::from(std::process::id() as usize),
+            last_mem_refresh: Instant::now() - Duration::from_secs(10),
+            palette: crate::ui::palette::PaletteState::default(),
         }
     }
 
@@ -496,7 +509,64 @@ impl GrokApp {
             )) {
                 *toggle_voice = true;
             }
+            if i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::K,
+            )) {
+                self.palette.open();
+            }
         });
+    }
+
+    fn handle_palette_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: crate::ui::palette::PaletteAction,
+    ) {
+        use crate::ui::palette::PaletteAction as A;
+        match action {
+            A::None => {}
+            A::NewChat => self.new_chat(),
+            A::OpenSettings => self.settings_view.open = true,
+            A::ToggleVoice => self.toggle_voice(),
+            A::ToggleTts => {
+                let new_state = !self.chat_view.tts_enabled;
+                self.chat_view.tts_enabled = new_state;
+                let updated = self.settings.update(|s| s.tts_enabled = new_state);
+                let _ = self.store.save_settings(&updated);
+            }
+            A::ToggleRag => {
+                let updated = self.settings.update(|s| s.rag_enabled = !s.rag_enabled);
+                let _ = self.store.save_settings(&updated);
+                self.toaster.info(format!(
+                    "RAG {}",
+                    if updated.rag_enabled { "on" } else { "off" }
+                ));
+            }
+            A::Theme(mode) => {
+                let updated = self.settings.update(|s| s.theme = mode);
+                theme::apply(ctx, mode, updated.font_size);
+                let _ = self.store.save_settings(&updated);
+            }
+            A::Provider(p) => {
+                let updated = self.settings.update(|s| s.default_provider = p);
+                let _ = self.store.save_settings(&updated);
+                self.settings_view.api_key_buffer = load_existing_key(p);
+                self.toaster.info(format!("provider: {}", p.label()));
+            }
+            A::SelectChat(id) => {
+                self.active_chat = Some(id);
+                self.refresh_messages();
+            }
+            A::ExportActiveChat => {
+                if let Some(id) = self.active_chat {
+                    self.export_chat(id, crate::services::export::Format::Markdown);
+                }
+            }
+            A::Quit => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
     }
 
     fn toggle_pin(&mut self, id: Uuid) {
@@ -645,6 +715,19 @@ impl GrokApp {
         };
         if let Ok(n) = self.store.count_messages() {
             self.stats.messages_indexed = n;
+        }
+        // Refresh process memory at most once a second — it's the only system
+        // call in the hot loop, so we don't want to do it every frame.
+        if now.duration_since(self.last_mem_refresh) >= Duration::from_secs(1) {
+            self.sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[self.pid]),
+                true,
+                ProcessRefreshKind::nothing().with_memory(),
+            );
+            if let Some(proc_) = self.sys.process(self.pid) {
+                self.stats.mem_bytes = proc_.memory();
+            }
+            self.last_mem_refresh = now;
         }
     }
 }
@@ -880,6 +963,11 @@ impl eframe::App for GrokApp {
                 Err(e) => self.toaster.error(format!("index: {e}")),
             }
         }
+
+        // Command palette overlay (Cmd/Ctrl+K). Renders on top of everything.
+        let palette_action =
+            crate::ui::palette::render(&ctx, &mut self.palette, &self.chats, self.active_chat);
+        self.handle_palette_action(&ctx, palette_action);
 
         self.toaster.render(&ctx);
 

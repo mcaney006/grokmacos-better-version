@@ -122,7 +122,7 @@ fn build_input_stream(
         .default_input_config()
         .map_err(|e| AudioError::Config(e.to_string()))?;
     let sample_format = supported.sample_format();
-    let native_rate = supported.sample_rate().0;
+    let native_rate = supported.sample_rate();
     let channels = supported.channels() as usize;
     let config: StreamConfig = supported.into();
 
@@ -209,7 +209,7 @@ fn build_output_stream(
         .default_output_config()
         .map_err(|e| AudioError::Config(e.to_string()))?;
     let sample_format = supported.sample_format();
-    let native_rate = supported.sample_rate().0;
+    let native_rate = supported.sample_rate();
     let channels = supported.channels() as usize;
     let config: StreamConfig = supported.into();
 

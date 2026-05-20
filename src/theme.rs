@@ -16,6 +16,7 @@ pub const USER_BUBBLE: Color32 = Color32::from_rgb(36, 52, 46);
 pub const ASSISTANT_BUBBLE: Color32 = Color32::from_rgb(22, 27, 33);
 
 pub fn apply(ctx: &egui::Context, mode: ThemeMode, font_size: f32) {
+    install_icon_font(ctx);
     let mut style = (*ctx.global_style()).clone();
     match mode {
         ThemeMode::Cosmic => apply_cosmic(&mut style),
@@ -24,6 +25,20 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode, font_size: f32) {
     }
     apply_text_scale(&mut style, font_size);
     ctx.set_global_style(style);
+}
+
+/// Bundle the Phosphor icon font so we can use `egui_phosphor::regular::*`
+/// glyphs anywhere a RichText is accepted. Installed once per context.
+fn install_icon_font(ctx: &egui::Context) {
+    use std::sync::OnceLock;
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    if INSTALLED.get().is_some() {
+        return;
+    }
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+    let _ = INSTALLED.set(());
 }
 
 fn apply_cosmic(style: &mut Style) {

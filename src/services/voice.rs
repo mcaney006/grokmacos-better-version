@@ -81,7 +81,7 @@ impl VoiceSession {
                 }
             }
         });
-        sink.send(WsMessage::Text(config.to_string()))
+        sink.send(WsMessage::Text(config.to_string().into()))
             .await
             .map_err(|e| ApiError::WebSocket(e.to_string()))?;
 
@@ -104,7 +104,7 @@ impl VoiceSession {
                             "type": "input_audio_buffer.append",
                             "audio": b64,
                         });
-                        if let Err(e) = sink.send(WsMessage::Text(event.to_string())).await {
+                        if let Err(e) = sink.send(WsMessage::Text(event.to_string().into())).await {
                             let _ = uplink_events.send(VoiceEvent::Error(format!("uplink: {e}")));
                             break;
                         }
