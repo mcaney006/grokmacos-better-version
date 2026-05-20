@@ -33,8 +33,8 @@ jobs:
     name: cargo-deny (advisories + licenses + bans + sources)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: EmbarkStudios/cargo-deny-action@08f29ebbc9295095546acaf37220058f628a4720  # v2
         with:
           command: check advisories bans sources licenses
           arguments: --all-features
@@ -43,9 +43,9 @@ jobs:
     name: cargo-audit (RustSec advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           shared-key: audit
       - name: Install cargo-audit

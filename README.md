@@ -398,6 +398,40 @@ git push origin v0.1.0
 You can also kick off the workflow manually under **Actions → Release → Run
 workflow** (it'll build but won't publish a release unless triggered by a tag).
 
+### Verifying a release
+
+Every artifact under the **Releases** tab is:
+
+1. **Signed** via Sigstore keyless signing. The signing identity is the
+   GitHub Actions workflow that produced it; the signature + public cert
+   are recorded in the Rekor transparency log. No GPG keys.
+2. **Attested** with a SLSA v1.0 build-provenance attestation proving
+   the artifact came from this repository and this workflow.
+3. **Documented** by a CycloneDX 1.5 SBOM listing every dependency,
+   version, license, and source.
+
+To verify any artifact (one-time `cosign` install required —
+<https://docs.sigstore.dev/cosign/installation>):
+
+```bash
+# 1. Cryptographic signature + transparency-log entry
+cosign verify-blob \
+  --bundle GrokInsane-0.1.0.dmg.cosign-bundle \
+  --certificate-identity-regexp 'https://github.com/mcaney006/grokmacos-better-version/.github/workflows/release\.yml@.*' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  GrokInsane-0.1.0.dmg
+
+# 2. SLSA build provenance (requires `gh` CLI logged in)
+gh attestation verify GrokInsane-0.1.0.dmg --owner mcaney006
+
+# 3. SBOM — scan with Grype for known CVEs
+grype sbom:grok-insane-0.1.0.sbom.json
+```
+
+If any of those three steps fails, **do not run the binary**. Either
+the file was tampered with after release, or it didn't come from this
+repository at all.
+
 ### Building a DMG locally on macOS
 
 ```bash

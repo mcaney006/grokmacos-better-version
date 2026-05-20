@@ -49,6 +49,7 @@ fn run() -> Result<()> {
         "dist" => dist(),
         "bundle" => bundle(),
         "audit" => audit(),
+        "sbom" => sbom(),
         "sign" => sign(),
         "notarize" => notarize(),
         "dmg" => dmg(),
@@ -79,6 +80,7 @@ fn print_help() {
     println!("  dist          cargo build --release, strip, copy to dist/<target>/");
     println!("  bundle        per-OS bundle in dist/  (.app / .exe / staged dir)");
     println!("  audit         run cargo-audit + cargo-deny (installs them if missing)");
+    println!("  sbom          emit CycloneDX SBOM at dist/<triple>/grok-insane.sbom.json");
     println!("  sign          macOS: codesign --options runtime --timestamp with Developer ID");
     println!("  notarize      macOS: xcrun notarytool submit --wait + stapler");
     println!("  dmg           macOS: bundle -> sign -> notarize -> staple -> .dmg in dist/");
@@ -179,6 +181,38 @@ fn audit() -> Result<()> {
         "RUSTSEC-2024-0436",
     ])?;
     cargo(["deny", "check", "advisories", "bans", "sources", "licenses"])?;
+    Ok(())
+}
+
+/// Emit a CycloneDX 1.5 SBOM for the workspace at
+/// `dist/<host-triple>/grok-insane-<version>.sbom.json`. Used both locally
+/// (for vulnerability scanning with Grype/Trivy/dependency-track) and in
+/// the release pipeline, where every SBOM is signed alongside the binary.
+fn sbom() -> Result<()> {
+    ensure_installed("cargo-cyclonedx")?;
+    let out_dir = workspace_root().join("dist").join(host_target_triple());
+    std::fs::create_dir_all(&out_dir).context("create dist dir")?;
+
+    cargo([
+        "cyclonedx",
+        "--format",
+        "json",
+        "--override-filename",
+        "grok-insane-sbom",
+    ])?;
+
+    // cargo-cyclonedx writes the file to the package root. Move it next to
+    // the binary so consumers find both in one place.
+    let src = workspace_root().join("grok-insane-sbom.cdx.json");
+    let dst = out_dir.join(format!(
+        "grok-insane-{}.sbom.json",
+        env!("CARGO_PKG_VERSION")
+    ));
+    if src.exists() {
+        std::fs::rename(&src, &dst)
+            .with_context(|| format!("move {} -> {}", src.display(), dst.display()))?;
+        println!("sbom: {}", dst.display());
+    }
     Ok(())
 }
 

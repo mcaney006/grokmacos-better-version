@@ -30,10 +30,14 @@ jobs:
           - { os: windows-latest, label: "windows (x86_64)" }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      # All actions are pinned by commit SHA, not floating tags. Dependabot
+      # (see .github/dependabot.yml) updates them with the version comment so
+      # provenance stays auditable. Replacing a release tag is a known
+      # supply-chain attack vector (tj-actions/changed-files, March 2025).
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -42,7 +46,7 @@ jobs:
       # 20 and emits a deprecation warning when force-flipped to Node 24.
       # Swatinem/rust-cache@v2 understands `target/`, the cargo registry, and
       # git checkout caches as one unit and is Node 24 native.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           shared-key: ci-${{ runner.os }}-${{ runner.arch }}
           # Don't poison the cache if any step fails.
@@ -72,7 +76,7 @@ jobs:
         run: cargo xtask dist
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: grok-insane-${{ matrix.os }}
           path: dist/

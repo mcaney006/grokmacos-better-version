@@ -3,19 +3,15 @@ name: Release
 # Cuts a GitHub Release with signed + notarized macOS DMG (and platform
 # binaries for Linux + Windows) when you push a tag like `v0.1.0`.
 #
-# Required repository secrets for full macOS code-signing + notarization:
+# Pipeline per artifact:
+#   1. SHA-pinned actions check out + install rustc from rust-toolchain.toml
+#   2. Release build (macOS path: sign + notarize + DMG via xtask)
+#   3. CycloneDX SBOM generated for the workspace and bundled with the artifact
+#   4. cosign sign-blob produces a keyless Sigstore signature + transparency
+#      log entry (Rekor) for every uploaded file
+#   5. softprops/action-gh-release attaches everything to a GitHub Release
 #
-#   APPLE_CERTIFICATE_P12_BASE64   base64-encoded .p12 of the Developer ID Application cert
-#   APPLE_CERTIFICATE_PASSWORD     password used when exporting the .p12
-#   APPLE_DEVELOPER_ID_APPLICATION "Developer ID Application: Your Name (TEAMID)"
-#   APPLE_ID                       your apple id email
-#   APPLE_TEAM_ID                  your 10-char Team ID
-#   APPLE_APP_SPECIFIC_PASSWORD    app-specific password generated at appleid.apple.com
-#   KEYCHAIN_PASSWORD              any random string used to lock the ephemeral keychain
-#
-# If any Apple secret is missing the macOS build still runs but produces an
-# ad-hoc-signed DMG. Gatekeeper will warn on that build; only a notarized DMG
-# opens silently and maximises trust under SentinelOne/XProtect.
+# Apple secrets (see README "Releases" section for the full list).
 
 on:
   push:
@@ -35,6 +31,14 @@ env:
   RUST_BACKTRACE: short
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# `id-token: write` is what enables Sigstore keyless signing — the OIDC
+# token from this workflow is what cosign exchanges for a short-lived signing
+# cert from Fulcio.
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
 jobs:
   build:
     name: build ${{ matrix.label }}
@@ -42,20 +46,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-14,        label: "macOS (arm64)",   triple: "aarch64-apple-darwin",      artifact: "dmg" }
-          - { os: macos-13,        label: "macOS (x86_64)",  triple: "x86_64-apple-darwin",       artifact: "dmg" }
-          - { os: ubuntu-latest,   label: "Linux (x86_64)",  triple: "x86_64-unknown-linux-gnu",  artifact: "tar.gz" }
-          - { os: windows-latest,  label: "Windows (x86_64)",triple: "x86_64-pc-windows-msvc",    artifact: "zip" }
+          - { os: macos-14,       label: "macOS (arm64)",   triple: "aarch64-apple-darwin",     artifact: "dmg"    }
+          - { os: macos-13,       label: "macOS (x86_64)",  triple: "x86_64-apple-darwin",      artifact: "dmg"    }
+          - { os: ubuntu-latest,  label: "Linux (x86_64)",  triple: "x86_64-unknown-linux-gnu", artifact: "tar.gz" }
+          - { os: windows-latest, label: "Windows (x86_64)",triple: "x86_64-pc-windows-msvc",   artifact: "zip"    }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      # All actions are pinned by commit SHA. See the comment in ci.yml.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
-          toolchain: stable
+          # rust-toolchain.toml drives the actual channel; this line just adds
+          # the cross-compile target for this matrix entry.
           targets: ${{ matrix.triple }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           shared-key: release-${{ runner.os }}-${{ runner.arch }}
           cache-on-failure: false
@@ -69,8 +75,8 @@ jobs:
         if: startsWith(matrix.os, 'macos') && env.APPLE_CERTIFICATE_P12_BASE64 != ''
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD:    ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD:             ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_CERTIFICATE_PASSWORD:   ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD:            ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
           KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
@@ -88,6 +94,8 @@ jobs:
       # --- Build ------------------------------------------------------------
       - name: Release build (non-macOS)
         if: ${{ !startsWith(matrix.os, 'macos') }}
+        # `--locked` enforces Cargo.lock; combined with rust-toolchain.toml
+        # that's the deterministic-build contract.
         run: cargo build --release --target ${{ matrix.triple }} --locked
 
       - name: Build + sign + notarize + DMG (macOS)
@@ -99,7 +107,31 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD:    ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: cargo xtask dmg
 
-      # --- Stage artifacts --------------------------------------------------
+      # --- SBOM (CycloneDX 1.5 JSON) ----------------------------------------
+      # cargo-cyclonedx walks the dep graph and emits a deterministic JSON
+      # manifest that any SBOM consumer (dependency-track, Grype, Trivy) can
+      # ingest. Generated per-target so consumers see the actual deps used
+      # for *this* binary, not the union of all platforms.
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+
+      - name: Generate SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="dist/${{ matrix.triple }}"
+          mkdir -p "$OUT"
+          # The "all" format covers both JSON and XML so downstream tooling
+          # has a choice.
+          cargo cyclonedx \
+              --format json \
+              --target ${{ matrix.triple }} \
+              --override-filename "grok-insane-sbom"
+          # cargo-cyclonedx writes to the package root; move to the artifact dir.
+          mv grok-insane-sbom.cdx.json "$OUT/grok-insane-${{ github.ref_name }}-${{ matrix.triple }}.sbom.json" || true
+          ls -la "$OUT/"
+
+      # --- Stage final artifact names --------------------------------------
       - name: Stage Linux tarball
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -123,14 +155,40 @@ jobs:
                            -DestinationPath "$out\grok-insane-${{ github.ref_name }}-${{ matrix.triple }}.zip" `
                            -Force
 
+      # --- Sigstore keyless signing ----------------------------------------
+      # Every release artifact (.dmg, .tar.gz, .zip, .sbom.json) gets a
+      # detached cosign signature with a Rekor transparency-log entry. No
+      # GPG keys to rotate; the signing identity is this workflow's OIDC
+      # token, recorded publicly in the Fulcio/Rekor logs.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+
+      - name: cosign sign release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="dist/${{ matrix.triple }}"
+          shopt -s nullglob
+          for f in "$OUT"/*.dmg "$OUT"/*.tar.gz "$OUT"/*.zip "$OUT"/*.sbom.json; do
+            [ -e "$f" ] || continue
+            echo "::group::cosign sign $f"
+            cosign sign-blob --yes \
+                --bundle "$f.cosign-bundle" \
+                "$f"
+            echo "::endgroup::"
+          done
+          ls -la "$OUT/"
+
       # --- Upload per-OS artifact ------------------------------------------
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: grok-insane-${{ matrix.triple }}
           path: |
             dist/${{ matrix.triple }}/*.dmg
             dist/${{ matrix.triple }}/*.tar.gz
             dist/${{ matrix.triple }}/*.zip
+            dist/${{ matrix.triple }}/*.sbom.json
+            dist/${{ matrix.triple }}/*.cosign-bundle
           if-no-files-found: warn
 
   release:
@@ -140,8 +198,12 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           path: artifacts
           merge-multiple: true
@@ -149,13 +211,42 @@ jobs:
       - name: List artifacts
         run: ls -laR artifacts/
 
+      # Build provenance attestation (SLSA Level 3) — proves these artifacts
+      # were produced by *this* workflow run, signed via the same Sigstore
+      # transparency log used for the artifact signatures.
+      - name: Generate SLSA provenance attestation
+        uses: actions/attest-build-provenance@b3e506e8c389afc651c5bacf2b8f2a1ea0557215  # v4
+        with:
+          subject-path: |
+            artifacts/**/*.dmg
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           name: GrokInsane ${{ github.ref_name }}
           generate_release_notes: true
           fail_on_unmatched_files: false
+          body: |
+            ### Verifying this release
+
+            Every artifact below is signed via Sigstore (keyless OIDC) and
+            has a CycloneDX SBOM. To verify:
+
+            ```bash
+            cosign verify-blob \
+                --bundle <artifact>.cosign-bundle \
+                --certificate-identity-regexp 'https://github.com/${{ github.repository }}/.github/workflows/release\.yml@.*' \
+                --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+                <artifact>
+            ```
+
+            The SLSA provenance attestation can be inspected with
+            `gh attestation verify <artifact> --owner ${{ github.repository_owner }}`.
           files: |
             artifacts/**/*.dmg
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
+            artifacts/**/*.sbom.json
+            artifacts/**/*.cosign-bundle

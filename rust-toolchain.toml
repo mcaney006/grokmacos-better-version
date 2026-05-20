@@ -1,0 +1,15 @@
+# Pin the exact Rust toolchain so every CI runner and every contributor
+# compiles with the same rustc. Combined with `Cargo.lock`, this is what
+# makes release builds bit-for-bit reproducible.
+#
+# When you bump this:
+#   1. Verify `cargo xtask check` still passes on the new channel.
+#   2. Update the comment in .github/workflows/ci.yml that references it.
+#
+# 1.94.0 is the floor at the time of writing because sysinfo 0.37 requires
+# 1.88 and several other transitive deps want >= 1.90.
+
+[toolchain]
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
