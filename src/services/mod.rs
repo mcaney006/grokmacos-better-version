@@ -9,4 +9,5 @@ pub mod export;
 pub mod local;
 pub mod openai;
 pub mod providers;
+pub mod sse;
 pub mod voice;

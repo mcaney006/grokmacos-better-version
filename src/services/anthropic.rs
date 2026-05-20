@@ -99,17 +99,21 @@ impl ChatProvider for AnthropicClient {
             });
         }
 
+        let request_id = crate::services::chat::extract_request_id(resp.headers());
         let stream = resp.bytes_stream();
-        Ok(Box::pin(sse_to_events(stream)))
+        Ok(Box::pin(sse_to_events(stream, request_id)))
     }
 }
 
-fn sse_to_events<S>(input: S) -> impl futures_util::Stream<Item = Result<ChatEvent, ApiError>>
+fn sse_to_events<S>(
+    input: S,
+    request_id: Option<String>,
+) -> impl futures_util::Stream<Item = Result<ChatEvent, ApiError>>
 where
     S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
 {
     use futures_util::stream;
-    let state = AnthropicDecoder::default();
+    let state = AnthropicDecoder::new(request_id);
     stream::unfold(
         (Box::pin(input), state, false),
         |(mut input, mut state, done)| async move {
@@ -118,7 +122,8 @@ where
             }
             loop {
                 if let Some(event) = state.next_event() {
-                    return Some((Ok(event), (input, state, false)));
+                    let terminal = event.is_err() || matches!(event, Ok(ChatEvent::Done));
+                    return Some((event, (input, state, terminal)));
                 }
                 match input.next().await {
                     Some(Ok(chunk)) => state.feed(&chunk),
@@ -126,7 +131,7 @@ where
                     None => {
                         state.eof();
                         if let Some(event) = state.next_event() {
-                            return Some((Ok(event), (input, state, true)));
+                            return Some((event, (input, state, true)));
                         }
                         return None;
                     }
@@ -136,27 +141,68 @@ where
     )
 }
 
-#[derive(Default)]
+/// After this many JSON parse failures in a single stream we stop trying.
+/// See the same constant in `chat.rs` for rationale.
+const ANTHROPIC_PARSE_FAILURE_LIMIT: u32 = 3;
+
+/// Anthropic SSE decoder.
+///
+/// Failure model — what changed from the original version:
+/// * The queue is `VecDeque<Result<ChatEvent, ApiError>>`, not just
+///   `VecDeque<ChatEvent>`. This is what lets us surface provider
+///   `error` events as actual errors instead of pretending they were
+///   empty content deltas.
+/// * `eof()` without a `message_stop` is a `StreamTruncated` error,
+///   not a synthetic `Done`. A dropped connection no longer looks like
+///   a clean completion.
+/// * Repeated JSON parse failures escalate to a `ProviderStream` error
+///   after `ANTHROPIC_PARSE_FAILURE_LIMIT` strikes. Either the
+///   protocol drifted or the upstream is malicious; either way silent
+///   loss is the wrong answer.
+/// * `request_id` from the response headers is captured at
+///   construction and embedded in every error variant — production
+///   support is unworkable without it.
 struct AnthropicDecoder {
-    // Byte-level buffer; only decode UTF-8 at line boundaries. See the
-    // identical fix in `chat.rs::SseDecoder` for full rationale.
-    buf: Vec<u8>,
-    pending: std::collections::VecDeque<ChatEvent>,
+    buf: crate::services::sse::LineByteBuffer,
+    pending: std::collections::VecDeque<Result<ChatEvent, ApiError>>,
     saw_stop: bool,
     input_tokens: u32,
     output_tokens: u32,
+    parse_failures: u32,
+    request_id: Option<String>,
 }
 
 impl AnthropicDecoder {
+    fn new(request_id: Option<String>) -> Self {
+        Self {
+            buf: Default::default(),
+            pending: Default::default(),
+            saw_stop: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            parse_failures: 0,
+            request_id,
+        }
+    }
+
     fn feed(&mut self, bytes: &[u8]) {
-        self.buf.extend_from_slice(bytes);
-        while let Some(idx) = self.buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = self.buf.drain(..=idx).collect();
-            let end = line_bytes
-                .len()
-                .saturating_sub(if line_bytes.ends_with(b"\r\n") { 2 } else { 1 });
-            let line = String::from_utf8_lossy(&line_bytes[..end]);
+        use crate::services::sse::BufferStatus;
+        if self.buf.extend(bytes) == BufferStatus::Overflow {
+            self.push_truncation(format!(
+                "SSE line buffer exceeded {} bytes",
+                crate::services::sse::LINE_BUDGET_BYTES
+            ));
+            return;
+        }
+        while let Some(line) = self.buf.take_line() {
             if line.is_empty() {
+                continue;
+            }
+            // SSE comments start with `:`. We also pass through `event:`
+            // lines without dispatching on them — Anthropic's current API
+            // emits redundant `event:` for every `data:`, so the data line
+            // alone is enough.
+            if line.starts_with(':') || line.starts_with("event:") {
                 continue;
             }
             let Some(rest) = line.strip_prefix("data:") else {
@@ -166,7 +212,7 @@ impl AnthropicDecoder {
             match serde_json::from_str::<AnthropicEvent>(payload) {
                 Ok(AnthropicEvent::ContentBlockDelta { delta }) => match delta {
                     AnthropicDelta::TextDelta { text } if !text.is_empty() => {
-                        self.pending.push_back(ChatEvent::Delta(text));
+                        self.pending.push_back(Ok(ChatEvent::Delta(text)));
                     }
                     _ => {}
                 },
@@ -181,20 +227,40 @@ impl AnthropicDecoder {
                     }
                 }
                 Ok(AnthropicEvent::MessageStop) => {
-                    self.pending.push_back(ChatEvent::Usage {
+                    self.pending.push_back(Ok(ChatEvent::Usage {
                         input: self.input_tokens,
                         output: self.output_tokens,
-                    });
-                    self.pending.push_back(ChatEvent::Done);
+                    }));
+                    self.pending.push_back(Ok(ChatEvent::Done));
                     self.saw_stop = true;
                 }
                 Ok(AnthropicEvent::Error { error }) => {
-                    self.pending.push_back(ChatEvent::Delta(String::new()));
-                    tracing::warn!(error = %error.message, "anthropic error event");
+                    // Provider said something is wrong. Surface it as a
+                    // typed stream error so the UI can show it, log
+                    // pipelines pick it up, and incident response has
+                    // the request-id to lean on.
+                    self.push_provider_error(format!(
+                        "{}: {}",
+                        error.kind.as_deref().unwrap_or("error"),
+                        error.message
+                    ));
                 }
-                Ok(_) => {}
+                Ok(_) => {} // ping / content_block_start / content_block_stop
                 Err(e) => {
-                    tracing::debug!(error = %e, payload = %payload, "anthropic sse parse fail");
+                    self.parse_failures += 1;
+                    tracing::warn!(
+                        error = %e,
+                        payload = %payload,
+                        failures = self.parse_failures,
+                        request_id = ?self.request_id,
+                        "anthropic sse parse fail"
+                    );
+                    if self.parse_failures >= ANTHROPIC_PARSE_FAILURE_LIMIT {
+                        self.push_provider_error(format!(
+                            "too many malformed Anthropic SSE events ({})",
+                            self.parse_failures
+                        ));
+                    }
                 }
             }
         }
@@ -202,13 +268,34 @@ impl AnthropicDecoder {
 
     fn eof(&mut self) {
         if !self.saw_stop {
-            self.pending.push_back(ChatEvent::Done);
-            self.saw_stop = true;
+            self.push_truncation(
+                "stream ended before message_stop (connection dropped, proxy timeout, \
+                 or provider terminated abnormally)"
+                    .to_string(),
+            );
         }
     }
 
-    fn next_event(&mut self) -> Option<ChatEvent> {
+    fn next_event(&mut self) -> Option<Result<ChatEvent, ApiError>> {
         self.pending.pop_front()
+    }
+
+    fn push_truncation(&mut self, msg: String) {
+        self.saw_stop = true;
+        self.pending.push_back(Err(ApiError::StreamTruncated {
+            provider: "anthropic",
+            message: msg,
+            request_id: ApiError::fmt_request_id(self.request_id.as_deref()),
+        }));
+    }
+
+    fn push_provider_error(&mut self, msg: String) {
+        self.saw_stop = true;
+        self.pending.push_back(Err(ApiError::ProviderStream {
+            provider: "anthropic",
+            message: msg,
+            request_id: ApiError::fmt_request_id(self.request_id.as_deref()),
+        }));
     }
 }
 
@@ -281,6 +368,12 @@ struct MessageDeltaUsage {
 struct AnthropicErrorBody {
     #[serde(default)]
     message: String,
+    /// Anthropic includes a `type` discriminator on error bodies
+    /// (`overloaded_error`, `invalid_request_error`, etc.). We propagate
+    /// it into the structured error so incident response can route by
+    /// category, not just by message text.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
 }
 
 #[cfg(test)]
@@ -288,9 +381,17 @@ struct AnthropicErrorBody {
 mod tests {
     use super::*;
 
+    fn collect(d: &mut AnthropicDecoder) -> Vec<Result<ChatEvent, ApiError>> {
+        let mut out = Vec::new();
+        while let Some(e) = d.next_event() {
+            out.push(e);
+        }
+        out
+    }
+
     #[test]
     fn anthropic_decoder_parses_text_delta_and_stop() {
-        let mut d = AnthropicDecoder::default();
+        let mut d = AnthropicDecoder::new(None);
         d.feed(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
         );
@@ -300,22 +401,168 @@ mod tests {
             b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":7}}\n\n",
         );
         d.feed(b"data: {\"type\":\"message_stop\"}\n\n");
-        let mut deltas = Vec::new();
-        let mut saw_usage = false;
-        let mut saw_done = false;
-        while let Some(e) = d.next_event() {
-            match e {
-                ChatEvent::Delta(s) => deltas.push(s),
-                ChatEvent::Usage { input, output } => {
-                    saw_usage = true;
-                    assert_eq!(input, 3);
-                    assert_eq!(output, 7);
-                }
-                ChatEvent::Done => saw_done = true,
-            }
-        }
+
+        let events: Vec<ChatEvent> = collect(&mut d).into_iter().filter_map(Result::ok).collect();
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::Delta(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(deltas.join(""), "Hello, world");
+        let saw_usage = events.iter().any(|e| {
+            matches!(
+                e,
+                ChatEvent::Usage {
+                    input: 3,
+                    output: 7
+                }
+            )
+        });
         assert!(saw_usage);
-        assert!(saw_done);
+        assert!(events.iter().any(|e| matches!(e, ChatEvent::Done)));
+    }
+
+    /// Regression: an Anthropic `error` event must become an actual stream
+    /// error, not a polite empty delta. The old code emitted an empty
+    /// `ChatEvent::Delta(String::new())` and let the stream continue —
+    /// the UI then displayed "completed successfully" with no indication
+    /// that the provider had said anything at all.
+    #[test]
+    fn anthropic_decoder_turns_error_event_into_stream_error() {
+        let mut d = AnthropicDecoder::new(Some("req-xyz".into()));
+        d.feed(b"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"the model is overloaded\"}}\n\n");
+
+        let events = collect(&mut d);
+        let err = events
+            .into_iter()
+            .find_map(|e| e.err())
+            .expect("expected a stream error");
+        match err {
+            ApiError::ProviderStream {
+                provider,
+                message,
+                request_id,
+            } => {
+                assert_eq!(provider, "anthropic");
+                assert!(message.contains("overloaded"), "msg: {message}");
+                assert!(request_id.contains("req-xyz"), "request-id: {request_id}");
+            }
+            other => panic!("expected ProviderStream, got {other:?}"),
+        }
+    }
+
+    /// Regression: EOF before `message_stop` is truncation, not success.
+    /// Previously the decoder synthesised `Done` at EOF — connection drops,
+    /// proxy timeouts, and provider crashes all looked identical to clean
+    /// completion.
+    #[test]
+    fn anthropic_decoder_errors_on_eof_before_message_stop() {
+        let mut d = AnthropicDecoder::new(Some("req-trunc".into()));
+        d.feed(b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n");
+        d.eof();
+
+        let events = collect(&mut d);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Ok(ChatEvent::Delta(s)) if s == "partial")),
+            "expected the partial delta we did receive"
+        );
+        let err = events
+            .into_iter()
+            .find_map(|e| e.err())
+            .expect("expected a truncation error");
+        match err {
+            ApiError::StreamTruncated {
+                provider,
+                request_id,
+                ..
+            } => {
+                assert_eq!(provider, "anthropic");
+                assert!(request_id.contains("req-trunc"));
+            }
+            other => panic!("expected StreamTruncated, got {other:?}"),
+        }
+    }
+
+    /// Regression: a multi-byte codepoint split across two `feed()` calls
+    /// reconstructs cleanly. Previously the decoder ran `from_utf8` per
+    /// chunk and lossy-replaced orphan continuation bytes with U+FFFD.
+    #[test]
+    fn anthropic_decoder_handles_utf8_split_across_chunks() {
+        let mut d = AnthropicDecoder::new(None);
+        let full = "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello 🦀\"}}\n\n".as_bytes();
+        // Split inside the emoji's UTF-8 bytes.
+        let split = full.len() - 5;
+        d.feed(&full[..split]);
+        d.feed(&full[split..]);
+        d.feed(b"data: {\"type\":\"message_stop\"}\n\n");
+
+        let events: Vec<ChatEvent> = collect(&mut d).into_iter().filter_map(Result::ok).collect();
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::Delta(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains('🦀'), "got {text:?}");
+        assert!(!text.contains('\u{FFFD}'), "got {text:?}");
+    }
+
+    /// Regression: persistent JSON parse failures should surface as a
+    /// stream error after `ANTHROPIC_PARSE_FAILURE_LIMIT` strikes, not
+    /// pretend everything is fine forever.
+    #[test]
+    fn anthropic_decoder_surfaces_repeated_parse_failures() {
+        let mut d = AnthropicDecoder::new(None);
+        for _ in 0..ANTHROPIC_PARSE_FAILURE_LIMIT {
+            d.feed(b"data: {not-valid-json\n\n");
+        }
+        let err = collect(&mut d)
+            .into_iter()
+            .find_map(|e| e.err())
+            .expect("expected error after repeated parse failures");
+        assert!(
+            matches!(err, ApiError::ProviderStream { .. }),
+            "expected ProviderStream, got {err:?}"
+        );
+    }
+
+    /// Property test: the decoder must never panic regardless of how
+    /// adversarial the input is. We feed arbitrary byte blobs in
+    /// arbitrary-sized chunks and assert that `feed` + `eof` + `next_event`
+    /// always return cleanly.
+    ///
+    /// Uses a simple LCG so this stays a unit test (no extra dep) and
+    /// rotates through 1000 deterministic seeds — equivalent in coverage
+    /// to a small proptest run.
+    #[test]
+    fn anthropic_decoder_never_panics_on_arbitrary_bytes() {
+        fn rng_byte(state: &mut u64) -> u8 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (*state >> 33) as u8
+        }
+        for seed in 0..1000u64 {
+            let mut state = seed.wrapping_add(0xDEAD_BEEF);
+            let mut d = AnthropicDecoder::new(None);
+            // Up to 8 chunks, each up to 256 random bytes.
+            let chunks = (rng_byte(&mut state) % 8) as usize + 1;
+            for _ in 0..chunks {
+                let n = (rng_byte(&mut state) as usize) + 1;
+                let mut buf = Vec::with_capacity(n);
+                for _ in 0..n {
+                    buf.push(rng_byte(&mut state));
+                }
+                d.feed(&buf);
+            }
+            d.eof();
+            // Drain — should never panic.
+            while d.next_event().is_some() {}
+        }
     }
 }

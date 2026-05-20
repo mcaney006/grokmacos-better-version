@@ -56,11 +56,8 @@ pub fn http_client(policy: HttpPolicy) -> Client {
         .expect("reqwest client")
 }
 
-/// Hard cap on the in-memory buffer the SSE decoder will hold between
-/// newlines. A server that streams a single line without ever terminating
-/// would otherwise blow up RAM. 4 MiB is far more than any well-formed
-/// streaming chunk should ever reach.
-const SSE_LINE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+// The line-budget guard moved into `services::sse::LINE_BUDGET_BYTES`
+// when the byte-line buffer was extracted into a shared primitive.
 
 /// xAI Grok chat completions client. Endpoint is OpenAI-compatible.
 ///
@@ -159,18 +156,38 @@ impl ChatProvider for XaiClient {
             });
         }
 
+        let request_id = extract_request_id(resp.headers());
         let stream = resp.bytes_stream();
-        Ok(Box::pin(sse_to_events(stream)))
+        Ok(Box::pin(sse_to_events(stream, request_id)))
     }
 }
 
-fn sse_to_events<S>(input: S) -> impl futures_util::Stream<Item = Result<ChatEvent, ApiError>>
+/// Extract the provider's request-id header for observability. xAI + OpenAI
+/// both use `x-request-id`; Anthropic uses `request-id`. We probe both
+/// because the same helper is used by both providers via the shared SSE
+/// decoder pipeline. Exposed `pub(crate)` so the Anthropic adapter can
+/// call it without duplicating the lookup table.
+pub(crate) fn extract_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    for name in ["request-id", "x-request-id"] {
+        if let Some(v) = headers.get(name) {
+            if let Ok(s) = v.to_str() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn sse_to_events<S>(
+    input: S,
+    request_id: Option<String>,
+) -> impl futures_util::Stream<Item = Result<ChatEvent, ApiError>>
 where
     S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
 {
     use futures_util::stream;
 
-    let state = SseDecoder::default();
+    let state = SseDecoder::new(request_id);
     stream::unfold(
         (Box::pin(input), state, false),
         |(mut input, mut state, done)| async move {
@@ -178,19 +195,22 @@ where
                 return None;
             }
             loop {
-                // Emit any events buffered from a previous chunk.
+                // Emit any events (or stream errors) buffered from a previous chunk.
                 if let Some(event) = state.next_event() {
-                    return Some((Ok(event), (input, state, false)));
+                    let terminal = event.is_err() || matches!(event, Ok(ChatEvent::Done));
+                    return Some((event, (input, state, terminal)));
                 }
                 match input.next().await {
                     Some(Ok(chunk)) => {
                         state.feed(&chunk);
                     }
-                    Some(Err(e)) => return Some((Err(ApiError::Http(e)), (input, state, true))),
+                    Some(Err(e)) => {
+                        return Some((Err(ApiError::Http(e)), (input, state, true)));
+                    }
                     None => {
                         state.eof();
                         if let Some(event) = state.next_event() {
-                            return Some((Ok(event), (input, state, true)));
+                            return Some((event, (input, state, true)));
                         }
                         return None;
                     }
@@ -200,47 +220,56 @@ where
     )
 }
 
-#[derive(Default)]
+/// OpenAI-compatible SSE decoder.
+///
+/// Failure model: the queue holds `Result<ChatEvent, ApiError>`, not just
+/// `ChatEvent`. That lets us emit truncation / overflow / parse-failure as
+/// real errors instead of pretending the stream finished cleanly. The UI
+/// already treats `Err` items from the stream as a `StreamMsg::Error` —
+/// the only thing we needed to do was actually emit them.
 struct SseDecoder {
-    // Raw byte buffer. Previously a `String` populated via
-    // `str::from_utf8(chunk)` per network chunk, which broke catastrophically
-    // when a chunk arrived split mid-UTF-8 codepoint: `from_utf8_lossy` would
-    // replace those bytes with U+FFFD and the rest of the codepoint would
-    // arrive as orphan continuation bytes. The fix is to buffer bytes and
-    // only decode at line boundaries — `\n` is always 0x0A, never inside a
-    // multi-byte codepoint, so line splits are codepoint-safe.
-    buf: Vec<u8>,
-    pending: std::collections::VecDeque<ChatEvent>,
-    last_was_done: bool,
+    buf: crate::services::sse::LineByteBuffer,
+    pending: std::collections::VecDeque<Result<ChatEvent, ApiError>>,
+    saw_done: bool,
+    parse_failures: u32,
+    /// Provider request-id captured from the response headers, propagated
+    /// into structured errors for support handoffs.
+    request_id: Option<String>,
 }
 
+/// After this many JSON parse failures in a single stream we stop trying.
+/// Persistent JSON failures usually mean either a wire-protocol drift or
+/// a malicious upstream; either way, "keep streaming nothing" is worse
+/// than "fail with a clear error".
+const SSE_PARSE_FAILURE_LIMIT: u32 = 3;
+
 impl SseDecoder {
+    fn new(request_id: Option<String>) -> Self {
+        Self {
+            buf: Default::default(),
+            pending: Default::default(),
+            saw_done: false,
+            parse_failures: 0,
+            request_id,
+        }
+    }
+
     fn feed(&mut self, bytes: &[u8]) {
-        self.buf.extend_from_slice(bytes);
-        // DoS guard: if the server never sends a newline we'd grow this
-        // buffer indefinitely. Trip the kill switch instead.
-        if self.buf.len() > SSE_LINE_BUDGET_BYTES {
-            tracing::warn!(
-                buf_bytes = self.buf.len(),
-                "SSE line buffer exceeded budget; ending stream"
-            );
-            self.buf.clear();
-            self.pending.push_back(ChatEvent::Done);
-            self.last_was_done = true;
+        use crate::services::sse::BufferStatus;
+        if self.buf.extend(bytes) == BufferStatus::Overflow {
+            self.push_truncation(format!(
+                "SSE line buffer exceeded {} bytes",
+                crate::services::sse::LINE_BUDGET_BYTES
+            ));
             return;
         }
-        // Process every complete line. `\n` (0x0A) is an ASCII byte that
-        // cannot appear inside a multi-byte UTF-8 codepoint, so splitting
-        // on it never bisects a character — `from_utf8_lossy` per line is
-        // safe even on adversarial input.
-        while let Some(idx) = self.buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = self.buf.drain(..=idx).collect();
-            // Strip trailing \n (and \r if present) before decoding.
-            let end = line_bytes
-                .len()
-                .saturating_sub(if line_bytes.ends_with(b"\r\n") { 2 } else { 1 });
-            let line = String::from_utf8_lossy(&line_bytes[..end]);
+        while let Some(line) = self.buf.take_line() {
             if line.is_empty() {
+                continue;
+            }
+            // SSE comments start with `:` per the spec. We don't use them
+            // but the parser must skip them rather than treat them as data.
+            if line.starts_with(':') {
                 continue;
             }
             let Some(rest) = line.strip_prefix("data:") else {
@@ -248,8 +277,8 @@ impl SseDecoder {
             };
             let payload = rest.trim_start();
             if payload == "[DONE]" {
-                self.last_was_done = true;
-                self.pending.push_back(ChatEvent::Done);
+                self.saw_done = true;
+                self.pending.push_back(Ok(ChatEvent::Done));
                 continue;
             }
             match serde_json::from_str::<StreamChunk>(payload) {
@@ -257,34 +286,66 @@ impl SseDecoder {
                     for choice in chunk.choices {
                         if let Some(content) = choice.delta.content {
                             if !content.is_empty() {
-                                self.pending.push_back(ChatEvent::Delta(content));
+                                self.pending.push_back(Ok(ChatEvent::Delta(content)));
                             }
                         }
                     }
                     if let Some(usage) = chunk.usage {
-                        self.pending.push_back(ChatEvent::Usage {
+                        self.pending.push_back(Ok(ChatEvent::Usage {
                             input: usage.prompt_tokens,
                             output: usage.completion_tokens,
-                        });
+                        }));
                     }
                 }
                 Err(e) => {
-                    self.pending.push_back(ChatEvent::Delta(String::new())); // keep stream alive
-                    tracing::debug!(error = %e, payload = %payload, "sse parse fail");
+                    self.parse_failures += 1;
+                    tracing::warn!(
+                        error = %e,
+                        payload = %payload,
+                        failures = self.parse_failures,
+                        request_id = ?self.request_id,
+                        "sse parse fail"
+                    );
+                    if self.parse_failures >= SSE_PARSE_FAILURE_LIMIT {
+                        self.push_provider_error(format!(
+                            "too many malformed SSE events ({})",
+                            self.parse_failures
+                        ));
+                    }
                 }
             }
         }
     }
 
     fn eof(&mut self) {
-        if !self.last_was_done {
-            self.pending.push_back(ChatEvent::Done);
-            self.last_was_done = true;
+        if !self.saw_done {
+            self.push_truncation(
+                "stream ended before [DONE] terminator (connection dropped or proxy timeout)"
+                    .to_string(),
+            );
         }
     }
 
-    fn next_event(&mut self) -> Option<ChatEvent> {
+    fn next_event(&mut self) -> Option<Result<ChatEvent, ApiError>> {
         self.pending.pop_front()
+    }
+
+    fn push_truncation(&mut self, msg: String) {
+        self.saw_done = true; // stop further EOF handling
+        self.pending.push_back(Err(ApiError::StreamTruncated {
+            provider: "openai-compatible",
+            message: msg,
+            request_id: ApiError::fmt_request_id(self.request_id.as_deref()),
+        }));
+    }
+
+    fn push_provider_error(&mut self, msg: String) {
+        self.saw_done = true;
+        self.pending.push_back(Err(ApiError::ProviderStream {
+            provider: "openai-compatible",
+            message: msg,
+            request_id: ApiError::fmt_request_id(self.request_id.as_deref()),
+        }));
     }
 }
 
@@ -339,39 +400,47 @@ struct Usage {
 mod tests {
     use super::*;
 
+    fn collect_ok(d: &mut SseDecoder) -> Vec<ChatEvent> {
+        let mut out = Vec::new();
+        while let Some(item) = d.next_event() {
+            if let Ok(ev) = item {
+                out.push(ev);
+            }
+        }
+        out
+    }
+
     #[test]
     fn sse_decoder_extracts_deltas_and_done() {
-        let mut d = SseDecoder::default();
+        let mut d = SseDecoder::new(None);
         d.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi \"}}]}\n\n");
         d.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"there\"}}]}\n\n");
         d.feed(b"data: [DONE]\n\n");
-        let mut got = Vec::new();
-        while let Some(e) = d.next_event() {
-            got.push(format!("{e:?}"));
-        }
+        let got: Vec<String> = collect_ok(&mut d)
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect();
         assert!(got.iter().any(|s| s.contains("hi ")));
         assert!(got.iter().any(|s| s.contains("there")));
         assert!(got.iter().any(|s| s.contains("Done")));
     }
 
     /// Regression: a network chunk that splits a multi-byte UTF-8 codepoint
-    /// must not corrupt the rebuilt token. Previously the decoder ran
-    /// `str::from_utf8` per chunk and fell back to `from_utf8_lossy`, which
-    /// permanently replaced the orphan continuation bytes with U+FFFD.
+    /// must not corrupt the rebuilt token.
     #[test]
     fn sse_decoder_handles_utf8_split_across_chunks() {
-        let mut d = SseDecoder::default();
-        // "🎙" = 0xF0 0x9F 0x8E 0x99 (4 bytes). The full SSE line is
-        // `data: {"choices":[{"delta":{"content":"🎙"}}]}\n`. We feed it
-        // in two chunks split inside the emoji's bytes.
+        let mut d = SseDecoder::new(None);
         let full = b"data: {\"choices\":[{\"delta\":{\"content\":\"\xF0\x9F\x8E\x99\"}}]}\n\n";
         let split_at = full.iter().position(|&b| b == 0xF0).map(|i| i + 2).unwrap();
         d.feed(&full[..split_at]);
         d.feed(&full[split_at..]);
-        let mut deltas = Vec::new();
-        while let Some(ChatEvent::Delta(s)) = d.next_event() {
-            deltas.push(s);
-        }
+        let deltas: Vec<String> = collect_ok(&mut d)
+            .into_iter()
+            .filter_map(|e| match e {
+                ChatEvent::Delta(s) => Some(s),
+                _ => None,
+            })
+            .collect();
         let joined = deltas.concat();
         assert!(
             joined.contains('\u{1F399}'),
@@ -379,22 +448,62 @@ mod tests {
         );
         assert!(
             !joined.contains('\u{FFFD}'),
-            "decoder produced a replacement character, indicating UTF-8 was corrupted: {joined:?}"
+            "decoder produced a replacement character: {joined:?}"
         );
     }
 
-    /// Regression: a `data:` line that ends with `\r\n` (legitimate per the
-    /// SSE spec, common when servers explicitly use CRLF) was previously
-    /// fine because `line.pop()` stripped the `\r`. After moving to byte
-    /// buffering we have to keep that behaviour.
+    /// Regression: CRLF line endings must keep working after the byte-buffer
+    /// refactor.
     #[test]
     fn sse_decoder_handles_crlf_line_endings() {
-        let mut d = SseDecoder::default();
+        let mut d = SseDecoder::new(None);
         d.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"crlf\"}}]}\r\n\r\n");
-        let mut deltas = Vec::new();
-        while let Some(ChatEvent::Delta(s)) = d.next_event() {
-            deltas.push(s);
-        }
+        let deltas: Vec<String> = collect_ok(&mut d)
+            .into_iter()
+            .filter_map(|e| match e {
+                ChatEvent::Delta(s) => Some(s),
+                _ => None,
+            })
+            .collect();
         assert_eq!(deltas, vec!["crlf"]);
+    }
+
+    /// Regression: EOF before `[DONE]` is treated as truncation, NOT as a
+    /// clean stop. Previously the decoder synthesised `ChatEvent::Done` at
+    /// EOF, which meant a connection drop, proxy timeout, or upstream
+    /// crash all looked like normal completion to the UI.
+    #[test]
+    fn sse_decoder_treats_eof_before_done_as_truncation() {
+        let mut d = SseDecoder::new(Some("req-123".into()));
+        d.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n");
+        // No [DONE] line. Pretend the connection died.
+        d.eof();
+
+        // First event: the partial delta we did receive.
+        let first = d.next_event().expect("delta");
+        assert!(matches!(first, Ok(ChatEvent::Delta(ref s)) if s == "partial"));
+
+        // Second event: a structured truncation error carrying our request-id.
+        let second = d.next_event().expect("truncation error");
+        let err = second.expect_err("expected Err");
+        let rendered = err.to_string();
+        assert!(rendered.contains("truncated"), "got {rendered}");
+        assert!(rendered.contains("req-123"), "got {rendered}");
+    }
+
+    /// Regression: persistent JSON parse failures surface as a
+    /// `ProviderStream` error after `SSE_PARSE_FAILURE_LIMIT` strikes
+    /// instead of silently swallowing forever.
+    #[test]
+    fn sse_decoder_surfaces_repeated_parse_failures() {
+        let mut d = SseDecoder::new(None);
+        for _ in 0..SSE_PARSE_FAILURE_LIMIT {
+            d.feed(b"data: {not-json\n\n");
+        }
+        let err = d
+            .next_event()
+            .expect("error after repeated parse failures")
+            .expect_err("expected Err");
+        assert!(err.to_string().contains("malformed"), "got {err}");
     }
 }

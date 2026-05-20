@@ -60,6 +60,43 @@ pub enum ApiError {
     BadStatus { status: u16, body: String },
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+
+    // --- Streaming-specific failure modes ---------------------------------
+    // The original API conflated "the provider sent us garbage" with "the
+    // stream ended before its terminator" with "the server reported an
+    // error event mid-stream". Each is a different fix-it instruction and
+    // each deserves its own variant so the UI / logs can be precise.
+    #[error("{provider} stream error{request_id}: {message}")]
+    ProviderStream {
+        provider: &'static str,
+        message: String,
+        /// `request-id` header from the response, when we captured one.
+        /// Pre-formatted as `" (request-id …)"` so the Display impl above
+        /// doesn't have to know whether it's present.
+        request_id: String,
+    },
+    /// Stream closed before the provider sent its terminating event
+    /// (`message_stop` for Anthropic, `[DONE]` for OpenAI-compatible).
+    /// Distinguishes "everything completed cleanly" from "connection
+    /// dropped and the UI just got a polite EOF".
+    #[error("{provider} stream truncated{request_id}: {message}")]
+    StreamTruncated {
+        provider: &'static str,
+        message: String,
+        request_id: String,
+    },
+}
+
+impl ApiError {
+    /// Render an `Option<String>` request-id into the bracketed form
+    /// expected by the Display strings above. Keeps the formatting in one
+    /// place so it stays consistent across variants.
+    pub fn fmt_request_id(id: Option<&str>) -> String {
+        match id {
+            Some(rid) if !rid.is_empty() => format!(" (request-id {rid})"),
+            _ => String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
