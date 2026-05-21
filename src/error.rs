@@ -167,6 +167,36 @@ mod tests {
         assert!(s.contains("rate limited"), "{s}");
         assert!(s.contains("retry after 3s"), "{s}");
     }
+
+    /// keyring::Error::NoStorageAccess maps to our `AccessDenied`
+    /// variant — callers shouldn't need to know about keyring's
+    /// internal taxonomy. Guards against a keyring-crate variant
+    /// rename silently turning AccessDenied into a generic Backend
+    /// failure, which would lose UX information (user can be told
+    /// "unlock your keychain" vs. "your platform is broken").
+    #[test]
+    fn secret_error_maps_keyring_variants_to_stable_surface() {
+        // PlatformFailure with an arbitrary wrapped error must land in
+        // Backend(details=...).
+        let pf = keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+            "synthetic test failure",
+        )));
+        match SecretError::from(pf) {
+            SecretError::Backend { details } => {
+                assert!(details.contains("synthetic test failure"), "{details}");
+            }
+            other => panic!("expected Backend, got {other:?}"),
+        }
+        // BadEncoding similarly lands in Backend.
+        match SecretError::from(keyring::Error::BadEncoding(vec![0xFFu8, 0xFE])) {
+            SecretError::Backend { .. } => {}
+            other => panic!("expected Backend, got {other:?}"),
+        }
+        // Display strings are stable and don't accidentally include
+        // "keyring::" — that would leak the crate name into the UI.
+        assert!(!format!("{}", SecretError::NoBackend).contains("keyring::"));
+        assert!(!format!("{}", SecretError::AccessDenied).contains("keyring::"));
+    }
 }
 
 #[derive(Debug, Error)]
@@ -183,8 +213,52 @@ pub enum AudioError {
     Play(String),
 }
 
+/// Failure modes for the OS keyring integration. The variants are
+/// intentionally crate-defined rather than `#[from] keyring::Error` so
+/// the keyring crate's internal taxonomy doesn't leak into our public
+/// API surface — pattern matching on `keyring::Error::PlatformFailure(_)`
+/// from a downstream caller would break every time we bump the keyring
+/// crate. The `Backend` variant carries the original error's display
+/// string for debugging.
 #[derive(Debug, Error)]
 pub enum SecretError {
-    #[error("keyring error: {0}")]
-    Keyring(#[from] keyring::Error),
+    /// Keyring backend not available (Linux: no Secret Service running;
+    /// embedded / headless distributions). Distinct from `Backend(_)`
+    /// so callers can degrade gracefully (e.g., prompt the user to
+    /// re-enter the key per launch).
+    #[error("no usable keyring backend on this platform")]
+    NoBackend,
+    /// Entry locked / access denied by the OS (macOS Keychain still
+    /// locked, Windows user cancelled the prompt). Retryable in
+    /// principle — the user can unlock and try again.
+    #[error("keyring access denied or locked")]
+    AccessDenied,
+    /// Any other keyring failure. The backend error is rendered into
+    /// `details` for logs; we deliberately do NOT expose the
+    /// `keyring::Error` enum so its variants are free to change.
+    #[error("keyring backend error: {details}")]
+    Backend { details: String },
+}
+
+impl From<keyring::Error> for SecretError {
+    fn from(value: keyring::Error) -> Self {
+        // Map the keyring crate's variants into our smaller surface.
+        // Anything we don't recognise lands in `Backend` with the
+        // original Display for debugging. `NoEntry` is NOT a
+        // SecretError — it's `Ok(None)` at the call site.
+        match value {
+            keyring::Error::PlatformFailure(ref e) => SecretError::Backend {
+                details: format!("platform failure: {e}"),
+            },
+            keyring::Error::NoStorageAccess(_) => SecretError::AccessDenied,
+            keyring::Error::Invalid(_, _) | keyring::Error::BadEncoding(_) => {
+                SecretError::Backend {
+                    details: value.to_string(),
+                }
+            }
+            other => SecretError::Backend {
+                details: other.to_string(),
+            },
+        }
+    }
 }

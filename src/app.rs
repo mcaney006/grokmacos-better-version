@@ -386,9 +386,22 @@ impl GrokApp {
             return;
         };
         let mut should_clear = false;
-        let mut buffered: Vec<StreamMsg> = Vec::new();
-        while let Ok(msg) = rx.try_recv() {
-            buffered.push(msg);
+        // Bound the per-frame drain. Channel is unbounded (producer runs
+        // in tokio::spawn, UI consumes here at ~60Hz) but if a provider
+        // burst-emits N deltas during a single frame, processing them
+        // ALL in one drain pass would stretch the frame budget. Each
+        // delta is a small mutation but the markdown-render path further
+        // up is non-trivial, and a 1000-delta burst on a thinking-style
+        // model can blow past 16 ms. Cap at a generous bound and let
+        // the next frame pick up the tail — egui's continuous repaint
+        // is already requested whenever a stream is in flight.
+        const DRAIN_BUDGET: usize = 256;
+        let mut buffered: Vec<StreamMsg> = Vec::with_capacity(DRAIN_BUDGET.min(32));
+        for _ in 0..DRAIN_BUDGET {
+            match rx.try_recv() {
+                Ok(msg) => buffered.push(msg),
+                Err(_) => break,
+            }
         }
         // Debounce redb writes. The previous version did
         // `store.update_message(m)` per token — at 100 tok/s that's 100

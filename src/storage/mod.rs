@@ -22,16 +22,31 @@ pub mod search;
 
 use search::SearchIndex;
 
-// Centralised bincode 2 helpers. We use the standard config with a fixed-int
-// encoding and little-endian byte order so on-disk records are stable across
-// architectures. Anything that hits redb goes through these two functions.
+// Centralised bincode 2 helpers. The config:
+//   * `standard()` — variable-length integers, little-endian, stable across
+//     architectures.
+//   * `with_limit::<MAX_BLOB_BYTES>()` — caps every decoded record. The
+//     default config has no upper bound; a corrupted on-disk length prefix
+//     could otherwise drive the deserializer into a multi-gigabyte
+//     allocation before we even hit a parse error. 16 MiB is comfortably
+//     above any realistic message body (token-limit-bounded by the
+//     provider) and small enough that even an adversarial value fails
+//     fast rather than swapping the box.
+//
+// Anything that hits redb goes through these two functions.
+const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
+
+fn bincode_config() -> impl bincode::config::Config {
+    bincode::config::standard().with_limit::<MAX_BLOB_BYTES>()
+}
+
 fn bincode_serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StorageError> {
-    bincode::serde::encode_to_vec(value, bincode::config::standard())
+    bincode::serde::encode_to_vec(value, bincode_config())
         .map_err(|e| StorageError::Encode(e.to_string()))
 }
 
 fn bincode_deserialize<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError> {
-    let (value, _consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+    let (value, _consumed) = bincode::serde::decode_from_slice(bytes, bincode_config())
         .map_err(|e| StorageError::Decode(e.to_string()))?;
     Ok(value)
 }

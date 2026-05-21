@@ -90,7 +90,16 @@ fn run_cli(action: CliAction) -> anyhow::Result<()> {
             Ok(())
         }
         CliAction::Diag => diag(),
-        CliAction::ResetDb { confirm } => reset_db(confirm),
+        CliAction::ResetDb { confirm } => {
+            let exit = reset_db(confirm)?;
+            if let Some(msg) = exit.message {
+                eprintln!("{msg}");
+            }
+            if exit.code != 0 {
+                std::process::exit(exit.code);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -135,10 +144,23 @@ fn diag() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn reset_db(confirm: bool) -> anyhow::Result<()> {
+/// Result returned by `reset_db`. Distinct from `anyhow::Result` because
+/// the no-confirmation case is NOT a panic-worthy program error — it's
+/// a normal "user forgot the safety flag" exit. The previous version
+/// called `std::process::exit(2)` from inside a function that pretended
+/// to return Result, which would have hidden the early-exit from
+/// anything that wrapped reset_db in retry/log logic.
+struct ResetExit {
+    code: i32,
+    message: Option<String>,
+}
+
+fn reset_db(confirm: bool) -> anyhow::Result<ResetExit> {
     if !confirm {
-        eprintln!("refusing to wipe data without --yes");
-        std::process::exit(2);
+        return Ok(ResetExit {
+            code: 2,
+            message: Some("refusing to wipe data without --yes".to_owned()),
+        });
     }
     let db = paths::db_path();
     let idx = paths::index_path();
@@ -151,7 +173,10 @@ fn reset_db(confirm: bool) -> anyhow::Result<()> {
     }
     println!("removed {}", db.display());
     println!("removed {}", idx.display());
-    Ok(())
+    Ok(ResetExit {
+        code: 0,
+        message: None,
+    })
 }
 
 fn init_tracing() -> Vec<tracing_appender::non_blocking::WorkerGuard> {

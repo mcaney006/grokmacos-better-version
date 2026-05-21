@@ -353,7 +353,16 @@ pub(crate) fn extract_request_id(headers: &reqwest::header::HeaderMap) -> Option
     for name in ["request-id", "x-request-id"] {
         if let Some(v) = headers.get(name) {
             if let Ok(s) = v.to_str() {
-                return Some(s.to_string());
+                // Filter empty / whitespace-only IDs at the source so the
+                // Display layer doesn't have to handle them. The
+                // `fmt_request_id` helper already gates on `!is_empty`,
+                // but that's a render-time check — filtering here keeps
+                // the data model honest (None means "no id", not "empty
+                // string that we treat as none later").
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_owned());
+                }
             }
         }
     }
@@ -824,6 +833,32 @@ mod tests {
             ApiError::BadStatus { status, .. } => assert_eq!(status, 500),
             other => panic!("expected BadStatus, got {other:?}"),
         }
+    }
+
+    /// `extract_request_id` must filter empty / whitespace-only header
+    /// values. Otherwise downstream `fmt_request_id` would render
+    /// `" (request-id )"` for a peer that sends `request-id:` with
+    /// nothing after the colon — uglier than just omitting the field.
+    #[test]
+    fn extract_request_id_filters_empty_and_whitespace_only_headers() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        h.insert("request-id", HeaderValue::from_static(""));
+        assert_eq!(extract_request_id(&h), None, "empty value must filter");
+
+        h.insert("request-id", HeaderValue::from_static("   "));
+        assert_eq!(
+            extract_request_id(&h),
+            None,
+            "whitespace-only value must filter"
+        );
+
+        h.insert("request-id", HeaderValue::from_static("  abc-123  "));
+        assert_eq!(
+            extract_request_id(&h),
+            Some("abc-123".to_string()),
+            "valid id must be trimmed"
+        );
     }
 
     fn collect_ok(d: &mut SseDecoder) -> Vec<ChatEvent> {
