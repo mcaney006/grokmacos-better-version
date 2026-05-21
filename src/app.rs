@@ -9,13 +9,9 @@ use crate::config::SettingsHandle;
 use crate::error::ApiError;
 use crate::models::{Chat, Message, PerfStats, Provider, Role, Settings, WireMessage};
 use crate::secrets;
-use crate::services::anthropic::AnthropicClient;
 use crate::services::audio::VoiceAudio;
-use crate::services::chat::XaiClient;
 use crate::services::embeddings::Retriever;
-use crate::services::local::LocalClient;
-use crate::services::openai::OpenAiClient;
-use crate::services::providers::{ChatEvent, ChatProvider, ChatRequest};
+use crate::services::providers::{ChatEvent, ChatRequest};
 use crate::services::voice::{VoiceEvent, VoiceSession};
 use crate::storage::Store;
 use crate::theme;
@@ -1049,8 +1045,18 @@ fn provider_model(s: &Settings, p: Provider) -> &str {
     }
 }
 
+/// Load the API key for `provider` from the OS keyring into a plain
+/// `String` for the settings text-edit buffer. The key is wiped via
+/// `SettingsState::clear_securely` when the dialog closes; we don't
+/// hold it in a `Zeroizing<String>` because egui's `TextBuffer` trait
+/// isn't implemented for any wrapper and the intermediate buffer
+/// reallocations during typing would leak old copies regardless.
 fn load_existing_key(provider: Provider) -> String {
     match secrets::get_api_key(provider.id()) {
+        // `Zeroizing<String>` from the keyring is wiped when it drops
+        // at the end of this match arm. The plain-String copy we
+        // return lives in `api_key_buffer` and gets scrubbed by
+        // `clear_securely` on dialog close.
         Ok(Some(k)) => (*k).clone(),
         _ => String::new(),
     }
@@ -1082,12 +1088,7 @@ async fn run_completion(
     );
     let _enter = span.enter();
     tracing::info!(prompt_msgs = request.messages.len(), "stream open");
-    let client: Box<dyn ChatProvider + Send + Sync> = match provider {
-        Provider::Xai => Box::new(XaiClient::new(api_key)),
-        Provider::OpenAi => Box::new(OpenAiClient::new(api_key)),
-        Provider::Anthropic => Box::new(AnthropicClient::new(api_key)),
-        Provider::Local => Box::new(LocalClient::new(api_key)),
-    };
+    let client = crate::services::providers::make_client(provider, api_key);
     let stream = client.stream(request).await?;
     let started = std::time::Instant::now();
     consume_chat_stream(stream, cancel, tx, assistant_id).await;
@@ -1389,6 +1390,13 @@ impl eframe::App for GrokApp {
                     .info(format!("rebuilt search index — {n} messages")),
                 Err(e) => self.toaster.error(format!("index: {e}")),
             }
+        }
+        // Scrub the API-key buffer when the dialog closes OR when it
+        // was saved. Best-effort — see `SettingsState::clear_securely`
+        // for the threat-model caveats. The buffer typically holds
+        // ~50-100 bytes of key, easy to zeroize.
+        if action.close || action.save_api_key || action.clear_api_key {
+            self.settings_view.clear_securely();
         }
 
         // Command palette overlay (Cmd/Ctrl+K). Renders on top of everything.

@@ -4,12 +4,31 @@ use crate::models::{PerfStats, Provider, Settings, ThemeMode, VoicePersona};
 use crate::ui::perf_dashboard;
 use crate::ui::toast::Toaster;
 use egui::{Context, RichText, ScrollArea, TextEdit};
+use zeroize::Zeroize as _;
 
 #[derive(Default)]
 pub struct SettingsState {
     pub open: bool,
+    /// API key text-edit buffer. We don't wrap this in `Zeroizing`
+    /// because egui's `TextBuffer` trait isn't implemented for any
+    /// wrapper type, and egui's `TextEdit` reallocates the buffer
+    /// internally as the user types — those intermediate allocations
+    /// would leak unzeroed regardless of wrapper. The pragmatic
+    /// protection is `clear_securely` below: called when the dialog
+    /// closes, wipes the live bytes before the buffer goes idle.
     pub api_key_buffer: String,
     pub api_key_dirty: bool,
+}
+
+impl SettingsState {
+    /// Wipe the api-key bytes from RAM. Called on dialog close + after
+    /// a successful save. NOT a full guarantee against memory scraping
+    /// (intermediate egui reallocations may have leaked older copies
+    /// while typing); a best-effort scrub of the live buffer.
+    pub fn clear_securely(&mut self) {
+        self.api_key_buffer.zeroize();
+        self.api_key_dirty = false;
+    }
 }
 
 #[derive(Debug, Default, Clone)]

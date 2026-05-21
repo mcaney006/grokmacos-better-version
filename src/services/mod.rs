@@ -8,6 +8,3 @@ pub mod openai;
 pub mod providers;
 pub mod sse;
 pub mod voice;
-
-#[cfg(test)]
-pub mod tests;

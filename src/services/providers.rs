@@ -50,3 +50,21 @@ pub trait ChatProvider: Send + Sync {
     fn id(&self) -> Provider;
     async fn stream(&self, req: ChatRequest) -> Result<EventStream, ApiError>;
 }
+
+/// Construct the concrete `ChatProvider` implementation for a given
+/// `Provider`. Lives here, not in `app.rs`, because the UI module has
+/// no business knowing what `XaiClient` / `AnthropicClient` /
+/// `LocalClient` are. Adding a new provider should require touching
+/// exactly this function and the `Provider` enum — nothing else.
+pub fn make_client(provider: Provider, api_key: String) -> Box<dyn ChatProvider + Send + Sync> {
+    use crate::services::anthropic::AnthropicClient;
+    use crate::services::chat::XaiClient;
+    use crate::services::local::LocalClient;
+    use crate::services::openai::OpenAiClient;
+    match provider {
+        Provider::Xai => Box::new(XaiClient::new(api_key)),
+        Provider::OpenAi => Box::new(OpenAiClient::new(api_key)),
+        Provider::Anthropic => Box::new(AnthropicClient::new(api_key)),
+        Provider::Local => Box::new(LocalClient::new(api_key)),
+    }
+}
