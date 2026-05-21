@@ -127,9 +127,18 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String> {
 pub(crate) fn audit() -> Result<()> {
     ensure_installed("cargo-audit")?;
     ensure_installed("cargo-deny")?;
-    // Keep this ignore list in sync with `deny.toml` [advisories.ignore].
-    // Drop entries here when the affected version leaves the transitive
-    // graph; cargo-deny warns on unused ignores so they're easy to spot.
+    // `cargo audit` and `cargo deny` see different graphs:
+    //   * `audit` scans Cargo.lock and is feature-agnostic — every crate
+    //     that exists in the lockfile counts, including those behind
+    //     optional features that aren't enabled in the default build.
+    //   * `deny` scans the actual dep graph for the requested feature set.
+    //
+    // The fastembed-gated `--features rag` brings in three advisory-bearing
+    // transitives (number_prefix, paste, lru) that NEVER reach a default
+    // build but DO appear in Cargo.lock, so audit flags them. We ignore
+    // them at the audit level (they're warnings, not vulnerabilities) and
+    // do NOT ignore them at the deny level (so a future default-feature
+    // pull-in surfaces immediately).
     cargo([
         "audit",
         "--deny",
@@ -140,6 +149,13 @@ pub(crate) fn audit() -> Result<()> {
         "RUSTSEC-2024-0320",
         "--ignore",
         "RUSTSEC-2025-0141",
+        // ---- lockfile-only warnings (behind --features rag) ----
+        "--ignore",
+        "RUSTSEC-2024-0436", // paste unmaintained (via tokenizers, rav1e, image)
+        "--ignore",
+        "RUSTSEC-2025-0119", // number_prefix unmaintained (via indicatif → hf-hub)
+        "--ignore",
+        "RUSTSEC-2026-0002", // lru unsound (via tantivy)
     ])?;
     cargo(["deny", "check", "advisories", "bans", "sources", "licenses"])?;
     Ok(())
