@@ -56,15 +56,57 @@ each risk class with file/line references.
 - **Network**: `https_only` + TLS 1.2 floor on every cloud provider;
   rustls (not OpenSSL); pre-first-byte timeout only on streaming
   endpoints; capped error-body read.
+- **Auth headers** (`Authorization: Bearer …`, `x-api-key`,
+  WebSocket `Authorization`) are marked sensitive via
+  `HeaderValue::set_sensitive(true)`, so HTTP-middleware loggers that
+  honour the flag print `Sensitive` instead of the raw token.
 - **WebSocket**: 10s connect timeout, 15s send timeout, 90s receive
   watchdog.
 - **Secrets**: OS-keyring storage, `Zeroizing` in-process, tracing
   filters that suppress framework-level log dumps.
+- **Local provider host allowlist**: the Local provider — the only
+  one allowed to send plain HTTP — refuses any host that isn't
+  loopback (127.0.0.0/8, ::1, `localhost`). RFC 1918 / link-local /
+  `*.local` are accepted only when `GROK_INSANE_ALLOW_LAN_LOCAL=1`
+  is set in the environment. Public-internet hosts are NEVER
+  accepted from this provider. See `src/services/local.rs` for the
+  enforcement.
+- **SSE parse-failure logging**: payload bytes are NOT logged at
+  WARN. We log payload length + a per-process keyed hash
+  fingerprint so log readers can correlate repeated failures of
+  the same event without disclosing user content. Raw payloads are
+  trace-only (`RUST_LOG=…=trace`).
 - **Storage**: per-entry decode failures skipped with a log line —
   one corrupted row can never brick the app.
 - **CI/CD**: least-privilege `permissions`, `persist-credentials:
   false` everywhere, read-only release cache, template-injection-safe
   matrix passthrough, every action SHA-pinned.
+
+## What this app does NOT protect against
+
+Honest list. Treat every claim above as scoped to what its
+implementation actually does, not to what the word "secure" suggests.
+
+- **A compromised desktop session**: the OS keyring, in-process
+  memory, and any file the user can read are all reachable to
+  malware running as that user. There is no anti-tamper / anti-
+  debugging story, and adding one would be theatre.
+- **A locally-running malicious LLM**: the Local provider host
+  allowlist only prevents prompts from going to a public host. A
+  hostile process listening on 127.0.0.1 (e.g. an attacker who can
+  open a loopback socket) will receive prompts the user routes to
+  it. Don't run untrusted code on the same machine.
+- **Process-memory leakage**: `Zeroizing<String>` clears the buffer
+  on drop, but egui's `TextEdit` reallocates its backing buffer as
+  the user types, and those old allocations are not tracked. A
+  core dump or live debugger attached during key entry sees the
+  key.
+- **Side-channel timing**: API key comparisons happen inside the
+  provider, not in our code; we never branch on key bytes
+  locally.
+- **A determined endpoint operator** (any cloud LLM provider you
+  point this at) can log your prompts. That is the provider's
+  privacy policy, not a property of this client.
 
 ## Supported versions
 

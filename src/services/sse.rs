@@ -86,6 +86,47 @@ impl LineByteBuffer {
     }
 }
 
+/// Privacy-preserving payload fingerprint for log correlation.
+///
+/// SSE event payloads are content-laden — the model's response tokens
+/// land verbatim inside `data: {...}` lines. Logging the raw payload
+/// on a parse failure (or any other log event) sends user content
+/// into whatever log pipeline aggregates this process's stdout. We
+/// log this fingerprint instead: a short hex string derived from a
+/// keyed hash of the payload bytes. Two log lines with the same
+/// fingerprint were caused by the same payload; the fingerprint
+/// reveals nothing about the contents.
+///
+/// Uses `std::hash::DefaultHasher` (SipHash) keyed by a randomised
+/// process-startup seed so fingerprints aren't comparable across
+/// processes — a leaked log can't be cross-referenced with a known
+/// payload. Returns a 16-hex-char string.
+pub fn payload_fingerprint(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    PROCESS_SALT.with(|salt| salt.hash(&mut h));
+    bytes.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+thread_local! {
+    /// Per-process random salt used as a SipHash key for
+    /// `payload_fingerprint`. Initialised once per thread on first
+    /// access from `std::time::SystemTime` nanoseconds + thread id —
+    /// not cryptographically strong against an active attacker, but
+    /// enough to prevent log-fingerprint reuse across deployments.
+    static PROCESS_SALT: u64 = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            d.as_nanos().hash(&mut h);
+        }
+        std::thread::current().id().hash(&mut h);
+        h.finish()
+    };
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -149,5 +190,46 @@ mod tests {
         let payload = vec![b'x'; 1024];
         assert_eq!(b.extend(&payload), BufferStatus::Ok);
         assert!(b.has_pending());
+    }
+
+    /// Fingerprint property 1: deterministic within a single process
+    /// (same thread). Used by log readers to group repeated parse
+    /// failures of the same payload.
+    #[test]
+    fn payload_fingerprint_is_deterministic_within_process() {
+        let body = b"data: {\"hello\": \"world\"}\n";
+        let fp1 = payload_fingerprint(body);
+        let fp2 = payload_fingerprint(body);
+        assert_eq!(fp1, fp2, "same input must hash to same fingerprint");
+        assert_eq!(fp1.len(), 16, "fingerprint should be 16 hex chars");
+    }
+
+    /// Fingerprint property 2: different inputs hash to different
+    /// outputs (with overwhelming probability). One-bit difference is
+    /// the most aggressive check we can do without statistical tests.
+    #[test]
+    fn payload_fingerprint_differs_for_different_inputs() {
+        let fp_a = payload_fingerprint(b"alpha");
+        let fp_b = payload_fingerprint(b"beta");
+        let fp_a2 = payload_fingerprint(b"alphb"); // single-byte change
+        assert_ne!(fp_a, fp_b);
+        assert_ne!(fp_a, fp_a2);
+    }
+
+    /// Fingerprint property 3: the output is hex digits only — no
+    /// payload bytes ever appear in the fingerprint. Defence against
+    /// a future bug that pastes the input back into the output.
+    #[test]
+    fn payload_fingerprint_emits_only_hex_digits() {
+        let secret = b"the user typed their password here: hunter2";
+        let fp = payload_fingerprint(secret);
+        assert!(
+            fp.chars().all(|c| c.is_ascii_hexdigit()),
+            "fingerprint must be pure hex, got: {fp}"
+        );
+        assert!(
+            !fp.as_bytes().windows(7).any(|w| w == b"hunter2"),
+            "fingerprint must not contain the literal input"
+        );
     }
 }

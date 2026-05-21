@@ -75,11 +75,13 @@ impl ChatProvider for AnthropicClient {
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "x-api-key",
-            HeaderValue::from_str(&self.api_key)
-                .map_err(|e| ApiError::InvalidResponse(e.to_string()))?,
-        );
+        let mut key_header = HeaderValue::from_str(&self.api_key)
+            .map_err(|e| ApiError::InvalidResponse(e.to_string()))?;
+        // Mark x-api-key sensitive so any HTTP-middleware logger that
+        // honours the flag prints `Sensitive` instead of the raw key.
+        // Same rationale as the Bearer header in services::chat.
+        key_header.set_sensitive(true);
+        headers.insert("x-api-key", key_header);
         headers.insert(
             "anthropic-version",
             HeaderValue::from_static(ANTHROPIC_VERSION),
@@ -352,19 +354,38 @@ impl AnthropicDecoder {
                     // production logs on every heartbeat-shaped novelty,
                     // but available when investigating "stream looked
                     // weird" reports.
+                    // payload is content-laden (model output may be in
+                    // it). Keep it trace-only and add a non-leaking
+                    // info-level breadcrumb so production logs can see
+                    // that an unknown event was skipped.
+                    let fp = crate::services::sse::payload_fingerprint(payload.as_bytes());
+                    tracing::debug!(
+                        payload_bytes = payload.len(),
+                        payload_fp = %fp,
+                        "anthropic: ignoring unknown event type"
+                    );
                     tracing::trace!(
                         payload = %payload,
-                        "anthropic: ignoring unknown event type"
+                        "anthropic unknown event (raw payload, trace only)"
                     );
                 }
                 Err(e) => {
                     self.parse_failures += 1;
+                    // See chat.rs sse parse fail: payload contains user
+                    // content. Log a digest fingerprint at WARN, raw
+                    // payload only at TRACE for local debugging.
+                    let fp = crate::services::sse::payload_fingerprint(payload.as_bytes());
                     tracing::warn!(
                         error = %e,
-                        payload = %payload,
+                        payload_bytes = payload.len(),
+                        payload_fp = %fp,
                         failures = self.parse_failures,
                         request_id = ?self.request_id,
                         "anthropic sse parse fail"
+                    );
+                    tracing::trace!(
+                        payload = %payload,
+                        "anthropic sse parse fail (raw payload, trace only)"
                     );
                     if self.parse_failures >= ANTHROPIC_PARSE_FAILURE_LIMIT {
                         self.push_provider_error(format!(

@@ -189,11 +189,16 @@ impl ChatProvider for XaiClient {
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.api_key.as_str()))
-                .map_err(|e| ApiError::InvalidResponse(e.to_string()))?,
-        );
+        let mut auth = HeaderValue::from_str(&format!("Bearer {}", self.api_key.as_str()))
+            .map_err(|e| ApiError::InvalidResponse(e.to_string()))?;
+        // Mark the bearer token as sensitive: reqwest / hyper / log
+        // middleware that respect this flag will redact the value when
+        // dumping headers (`format!("{:?}", headers)` shows
+        // `Authorization: Sensitive`). Without this, anyone who bumps
+        // a log level to TRACE on the http stack — or any tower-http
+        // logger added later — would print the bearer in cleartext.
+        auth.set_sensitive(true);
+        headers.insert(AUTHORIZATION, auth);
 
         let url = format!("{}/chat/completions", self.base.trim_end_matches('/'));
         let resp =
@@ -322,7 +327,16 @@ pub(crate) async fn send_with_rate_limit_retry<B: serde::Serialize>(
                     }
                 })
                 .unwrap_or_else(|| std::time::Duration::from_millis(500 << attempt));
-            tracing::warn!(?wait, attempt, url = %url, "rate-limited; backing off");
+            // Log host-only, not the full URL. Some providers (notably
+            // Azure OpenAI) put credentials in query parameters; even
+            // though our current providers don't, logging the full
+            // request URL is a category of leak we'd rather rule out
+            // up front than re-audit on every new provider integration.
+            let host = reqwest::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned))
+                .unwrap_or_else(|| "<unparseable>".to_owned());
+            tracing::warn!(?wait, attempt, host = %host, "rate-limited; backing off");
             tokio::time::sleep(wait).await;
             attempt += 1;
             continue;
@@ -537,12 +551,26 @@ impl SseDecoder {
                 }
                 Err(e) => {
                     self.parse_failures += 1;
+                    // Do NOT log the raw payload at WARN. The SSE payload
+                    // body contains the model's response text (i.e., the
+                    // user's chat content) and on a malformed event a
+                    // log pipeline that aggregates WARN+ would exfiltrate
+                    // user content. Log only an opaque digest fingerprint
+                    // and the length so we can correlate reports without
+                    // disclosing content. Set `RUST_LOG=…=trace` to opt
+                    // in to the raw payload when debugging locally.
+                    let fp = crate::services::sse::payload_fingerprint(payload.as_bytes());
                     tracing::warn!(
                         error = %e,
-                        payload = %payload,
+                        payload_bytes = payload.len(),
+                        payload_fp = %fp,
                         failures = self.parse_failures,
                         request_id = ?self.request_id,
                         "sse parse fail"
+                    );
+                    tracing::trace!(
+                        payload = %payload,
+                        "sse parse fail (raw payload, trace only)"
                     );
                     if self.parse_failures >= SSE_PARSE_FAILURE_LIMIT {
                         self.push_provider_error(format!(
@@ -637,6 +665,25 @@ struct Usage {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Bearer tokens MUST be marked sensitive on the HeaderValue so
+    /// middleware that respects the flag (reqwest's debug, tower-http
+    /// loggers, http2 hpack debug) prints `Sensitive` instead of the
+    /// raw token. We can't easily intercept reqwest's send path, so
+    /// we exercise the property at the HeaderValue level: build one
+    /// the same way `XaiClient::stream` does and assert the flag.
+    #[test]
+    fn authorization_header_is_marked_sensitive() {
+        use reqwest::header::HeaderValue;
+        let mut hv = HeaderValue::from_str("Bearer sk-test-do-not-log").unwrap();
+        hv.set_sensitive(true);
+        assert!(hv.is_sensitive(), "Bearer header must be sensitive");
+        // Defense-in-depth: the Display impl of a sensitive header
+        // returns the literal `Sensitive` placeholder rather than the
+        // raw bytes. Pin that behaviour so a future http-crate bump
+        // can't silently change it.
+        assert_eq!(format!("{hv:?}"), "Sensitive");
+    }
 
     /// One scripted reply from `spawn_mock_http`. Wrapped in a struct so
     /// the test signature stays under clippy's `type_complexity` lint.

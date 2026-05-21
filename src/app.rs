@@ -1154,7 +1154,15 @@ async fn consume_chat_stream(
                 // the serialised input. Both `id` and `name` are bound
                 // by the wire schema to ASCII identifiers; we sanitise
                 // them defensively anyway.
-                tracing::info!(%id, %name, ?input, "anthropic tool_use");
+                // Tool args (`input`) are content-laden: the model produces
+                // them and they can contain prompt text, file paths, or
+                // user data. Log them only at DEBUG, and never the
+                // structured Debug form at INFO/WARN/ERROR. The structural
+                // fields below (id, name) are non-sensitive — name is
+                // bounded by the wire schema to an ASCII identifier and id
+                // is a server-issued correlation token.
+                tracing::debug!(%id, %name, input_bytes = input.to_string().len(), "tool_use");
+                tracing::trace!(%id, %name, ?input, "tool_use input (trace only)");
                 let safe_input = input
                     .to_string()
                     .replace("~~~", "~ ~ ~")

@@ -109,14 +109,18 @@ impl VoiceSession {
         let mut request = url
             .into_client_request()
             .map_err(|e| ApiError::WebSocket(e.to_string()))?;
-        request.headers_mut().insert(
-            "Authorization",
+        let mut auth: tokio_tungstenite::tungstenite::http::HeaderValue =
             format!("Bearer {api_key}").parse().map_err(
                 |e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| {
                     ApiError::WebSocket(e.to_string())
                 },
-            )?,
-        );
+            )?;
+        // Mark the bearer token sensitive — the underlying http crate's
+        // header impl respects this flag when Debug-formatting headers
+        // (which tokio-tungstenite does on handshake failure). Without
+        // it the token can land in a panic message or trace log.
+        auth.set_sensitive(true);
+        request.headers_mut().insert("Authorization", auth);
 
         let connect_fut = tokio_tungstenite::connect_async(request);
         let (ws, _) = match tokio::time::timeout(
