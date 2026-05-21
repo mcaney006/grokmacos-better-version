@@ -699,4 +699,33 @@ mod tests {
         let out = r.process(&[]);
         assert!(out.is_empty());
     }
+
+    /// Adversarial: the cpal-callback → bridge-thread capture queue is
+    /// bounded at `CAPTURE_QUEUE_DEPTH`. When a slow consumer can't keep
+    /// up, the cpal callback must NOT block (real-time audio principle);
+    /// `try_send` returns Err and we drop the frame. This test fills
+    /// the channel to capacity then proves the next send fails fast
+    /// without blocking the producer.
+    #[test]
+    fn capture_queue_drops_frames_when_consumer_lags() {
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<i16>>(CAPTURE_QUEUE_DEPTH);
+        // Fill to capacity. Every push must succeed.
+        for i in 0..CAPTURE_QUEUE_DEPTH {
+            let frame = vec![i as i16; 4];
+            assert!(tx.try_send(frame).is_ok(), "send {i} should succeed");
+        }
+        // One more must fail with Full, NOT block, NOT panic.
+        let outcome = tx.try_send(vec![0xBAD; 4]);
+        assert!(
+            matches!(outcome, Err(crossbeam_channel::TrySendError::Full(_))),
+            "expected Full, got {outcome:?}"
+        );
+        // Receiver still drains exactly CAPTURE_QUEUE_DEPTH frames in
+        // FIFO order — no corruption from the rejected push.
+        for i in 0..CAPTURE_QUEUE_DEPTH {
+            let frame = rx.try_recv().expect("frame should be queued");
+            assert_eq!(frame[0], i as i16);
+        }
+        assert!(rx.try_recv().is_err(), "queue should be drained");
+    }
 }

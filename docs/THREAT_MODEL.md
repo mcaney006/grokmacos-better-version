@@ -39,8 +39,8 @@ reviewer can check whether a proposed change actually changes the model.
 | Parse-failure loop | After `SSE_PARSE_FAILURE_LIMIT = 3` consecutive failures the decoder escalates to `ProviderStream` error | `services::chat::SseDecoder`, `services::anthropic::AnthropicDecoder` |
 | Stream after terminator | Decoders refuse to emit events past `[DONE]` / `message_stop` even within a single feed() | both decoders' `feed` loop |
 | Hung connection | Pre-first-byte `tokio::time::timeout(60s)` on `.send()`; per-WS-send 15s timeout on uplink; 90s receive-side WS watchdog | `services::chat::send_with_rate_limit_retry`, `services::voice` |
-| Rate-limit storm | Bounded exponential backoff honouring `Retry-After` (capped at 30s); 3 retry budget; only retries 429, never 500-class | `services::chat::send_with_rate_limit_retry` |
-| Arbitrary-byte panic | `proptest` (256 cases × 4 KiB inputs) + in-tree LCG (1000 seeds × 8 KiB) + `cargo fuzz` continuous harness | `src/services/{chat,anthropic}.rs` tests + `fuzz/` |
+| Rate-limit storm (pre-stream) | Bounded exponential backoff honouring `Retry-After` (capped at 30s); 3 retry budget; only retries 429 at the initial handshake, never 500-class, never mid-stream. Streaming responses that go silent mid-flight are caught by the WS receive watchdog or by the SSE truncation error, NOT by this retry path. | `services::chat::send_with_rate_limit_retry` |
+| Arbitrary-byte panic | `proptest` (256 cases × 4 KiB inputs, shrunk counterexamples auto-persisted to `proptest-regressions/`) + in-tree LCG (1000 seeds × 8 KiB). `cargo fuzz` **harnesses ready** in `fuzz/` for on-demand campaigns; not currently run by CI (would require a nightly toolchain and a non-trivial corpus retention story — open work, do not claim continuous coverage). | `src/services/{chat,anthropic}.rs` tests + `fuzz/` |
 
 ### Against #2 (network MITM)
 

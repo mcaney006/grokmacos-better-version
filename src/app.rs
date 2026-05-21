@@ -68,6 +68,11 @@ pub struct GrokApp {
     // open happens on the tokio runtime so the UI never blocks; the result
     // lands here on completion and `drain_voice` picks it up.
     voice_open_rx: Option<tokio::sync::oneshot::Receiver<Result<VoiceSession, ApiError>>>,
+    /// Handle to the spawned `VoiceSession::open` task so a mid-connect
+    /// cancel (user rapid-toggles voice off) can `.abort()` it. Without
+    /// this the task ran to its 10s WS connect timeout in the
+    /// background, holding a TCP socket and TLS session for nothing.
+    voice_open_task: Option<tokio::task::JoinHandle<()>>,
 
     // Perf
     stats: PerfStats,
@@ -141,6 +146,7 @@ impl GrokApp {
             voice_session: None,
             voice_rx: None,
             voice_open_rx: None,
+            voice_open_task: None,
             stats: PerfStats::default(),
             last_frame: Instant::now(),
             frame_ema_ms: 16.0,
@@ -577,15 +583,26 @@ impl GrokApp {
             session.close();
             self.voice_rx = None;
             self.voice_open_rx = None;
+            // Abort the open task too, in case a session opened between
+            // the open spawn and this close (timing window is small but
+            // we don't want it hanging on to a runtime slot).
+            if let Some(t) = self.voice_open_task.take() {
+                t.abort();
+            }
             self.chat_view.voice_active = false;
             self.voice_audio = None;
             return;
         }
-        // If a previous toggle is mid-connect, cancel it by dropping the
-        // receiver — the spawned task's send-half will fail silently when
-        // it eventually tries to deliver.
+        // If a previous toggle is mid-connect, ABORT the spawned task,
+        // don't just drop the receiver. Previously the task ran to its
+        // 10s WS connect timeout in the background while the user had
+        // already moved on — pure waste of a tokio worker and an open
+        // TCP/TLS handshake.
         if self.voice_open_rx.is_some() {
             self.voice_open_rx = None;
+            if let Some(t) = self.voice_open_task.take() {
+                t.abort();
+            }
             self.voice_audio = None;
             self.voice_rx = None;
             self.chat_view.voice_active = false;
@@ -628,7 +645,7 @@ impl GrokApp {
         self.voice_open_rx = Some(session_rx);
         self.chat_view.voice_active = true; // optimistic — flipped back on failure
         let handle = self.runtime.handle().clone();
-        handle.spawn(async move {
+        let join_handle = handle.spawn(async move {
             let outcome = VoiceSession::open(api_key, persona, shared).await;
             let _ = session_tx.send(outcome.map(|mut session| {
                 // Forward events from the session into the UI-bound channel
@@ -647,6 +664,7 @@ impl GrokApp {
                 session
             }));
         });
+        self.voice_open_task = Some(join_handle);
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context, toggle_voice: &mut bool) {
@@ -1428,5 +1446,59 @@ mod tests {
             }
         }
         assert_eq!(dones, 1);
+    }
+
+    /// Adversarial: a model returning a tool_use with attacker-controlled
+    /// fences in the input JSON, plus newline/backtick/tilde in the id
+    /// and name fields, must NOT break out of the rendered markdown
+    /// fence. The sanitiser in the ToolUse arm escapes ``` and ~~~ and
+    /// scrubs control chars from id/name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn consume_chat_stream_sanitises_hostile_tool_use_fence_injection() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let assistant = Uuid::new_v4();
+        // id with newline, name with backtick + tilde, input with both
+        // fence styles inside a JSON string.
+        let s = fake_stream(vec![
+            Ok(ChatEvent::ToolUse {
+                id: "toolu_x\n!!! injected".into(),
+                name: "ev`il~~~name".into(),
+                input: serde_json::json!({
+                    "cmd": "ls; ```bash\nrm -rf /\n``` and ~~~ blah ~~~"
+                }),
+            }),
+            Ok(ChatEvent::Done),
+        ]);
+        consume_chat_stream(s, cancel, tx, assistant).await;
+        let mut rendered = String::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let StreamMsg::Delta(_, d) = msg {
+                rendered.push_str(&d);
+            }
+        }
+        // Fence integrity: the tilde-fence we emit must be at the start
+        // and end ONLY. Counting raw "```" and "~~~" in the output:
+        let raw_backticks = rendered.matches("```").count();
+        let raw_tildes_fence = rendered.matches("~~~").count();
+        // We open with `~~~tool-use` and close with `~~~`. The model's
+        // backticks and tildes are escaped to `` ` ` ` `` and `~ ~ ~`.
+        // Net: 0 `` ``` `` in output, exactly 2 `~~~` (open + close).
+        assert_eq!(
+            raw_backticks, 0,
+            "model backticks leaked into output — fence can be broken: {rendered}"
+        );
+        assert_eq!(
+            raw_tildes_fence, 2,
+            "expected exactly 2 ~~~ (open+close), got {raw_tildes_fence}: {rendered}"
+        );
+        // Newline injection in id is scrubbed.
+        assert!(
+            !rendered.contains("toolu_x\n!!!"),
+            "newline in id leaked through: {rendered}"
+        );
+        // The injection payload should still be visible in some form
+        // (we're sanitising, not censoring) but unable to break out.
+        assert!(rendered.contains("injected") || rendered.contains("inject"));
     }
 }

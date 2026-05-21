@@ -108,6 +108,13 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Number of indexed documents at the time of the most recent
+    /// committed segment view. Used by `Store::open` to detect
+    /// redb/tantivy divergence at startup and trigger a reindex.
+    pub fn doc_count(&self) -> u64 {
+        self.reader.searcher().num_docs()
+    }
+
     pub fn search(&self, q: &str, limit: usize) -> Result<Vec<Hit>, StorageError> {
         if q.trim().is_empty() {
             return Ok(Vec::new());

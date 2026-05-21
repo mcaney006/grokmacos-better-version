@@ -294,7 +294,12 @@ impl VoiceSession {
             loop {
                 ticker.tick().await;
                 let now = epoch_secs();
-                let last = watchdog_recv.load(Ordering::Relaxed);
+                // Acquire pairs with the Release store in the downlink
+                // task. Relaxed would be a correctness bug under weak
+                // memory models — the watchdog might observe a stale
+                // last_recv and fire a spurious deadline error on the
+                // tick that follows a fresh frame.
+                let last = watchdog_recv.load(Ordering::Acquire);
                 if now - last > WS_RECV_DEADLINE_SECS {
                     let _ = watchdog_events.send(VoiceEvent::Error(format!(
                         "ws receive watchdog: no frames for {}s (deadline {}s)",
@@ -319,7 +324,11 @@ impl VoiceSession {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
                     msg = stream.next() => {
-                        downlink_recv.store(epoch_secs(), Ordering::Relaxed);
+                        // Release pairs with the Acquire load in the
+                        // watchdog task: every fresh `last_recv` write
+                        // must be visible before the watchdog's next
+                        // tick observes it.
+                        downlink_recv.store(epoch_secs(), Ordering::Release);
                         match msg {
                             Some(Ok(WsMessage::Text(text))) => {
                                 match serde_json::from_str::<ServerEvent>(&text) {

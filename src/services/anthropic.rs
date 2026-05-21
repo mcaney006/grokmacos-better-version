@@ -906,6 +906,16 @@ mod tests {
     proptest::proptest! {
         #![proptest_config(proptest::test_runner::Config {
             cases: 256,
+            // Persist shrunk counterexamples next to the source so CI can
+            // reproduce a failure that initially appeared on a contributor's
+            // machine. Without this, proptest stores regressions in the
+            // ephemeral `target/` dir and a "passed on my laptop" reproducer
+            // is gone by the time CI runs.
+            failure_persistence: Some(Box::new(
+                proptest::test_runner::FileFailurePersistence::SourceParallel(
+                    "proptest-regressions"
+                ),
+            )),
             .. proptest::test_runner::Config::default()
         })]
 

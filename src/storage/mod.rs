@@ -83,7 +83,45 @@ impl Store {
             }),
         };
         store.migrate()?;
+        store.reconcile_index_on_startup()?;
         Ok(store)
+    }
+
+    /// Reconciliation contract: redb is the source of truth; tantivy is a
+    /// derived index. They can diverge if a process crash lands between
+    /// `insert_message`'s redb commit (line ~225) and the tantivy
+    /// `add_message` call (line ~228), or if a tantivy commit panics.
+    ///
+    /// At startup we compare `redb.count_messages` against
+    /// `tantivy.doc_count`. If they disagree we trigger a full rebuild
+    /// from redb. This is O(N) but only runs once per launch and only
+    /// when divergence is detected — the happy path is two cheap reads.
+    ///
+    /// Failure mode: if the rebuild itself fails, we log + continue with
+    /// the divergent index rather than refusing to launch. Stale-search
+    /// is a better UX than no-app.
+    fn reconcile_index_on_startup(&self) -> Result<(), StorageError> {
+        let redb_count = self.count_messages()?;
+        let index_count = self.inner.index.lock().doc_count();
+        if redb_count != index_count {
+            tracing::warn!(
+                redb_count,
+                index_count,
+                "search index diverged from redb storage on startup; rebuilding"
+            );
+            match self.rebuild_index() {
+                Ok(rebuilt) => {
+                    tracing::info!(rebuilt, "search index rebuild complete");
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "search index rebuild failed; continuing with divergent index"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn migrate(&self) -> Result<(), StorageError> {
@@ -409,7 +447,44 @@ mod tests {
         assert_eq!(listed.len(), 2, "bogus entry should have been skipped");
     }
 
-    /// Mirror of the above for `list_messages` within a chat.
+    /// Reconciliation: if the search index disagrees with redb at
+    /// startup (e.g., from a crash mid-insert), `Store::open` must
+    /// rebuild rather than serve stale search results forever.
+    #[test]
+    fn open_reconciles_search_index_when_redb_and_tantivy_diverge() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("db.redb");
+        let idx_dir = tmp.path().join("idx");
+
+        // Round 1: insert 5 messages, close the store.
+        {
+            let store = Store::open(&db_path, &idx_dir).unwrap();
+            let chat = Chat::new("xai", "grok-beta");
+            store.upsert_chat(&chat).unwrap();
+            for i in 0..5 {
+                let m = Message::new(chat.id, Role::User, format!("msg-{i}"));
+                store.insert_message(&m).unwrap();
+            }
+        }
+
+        // Round 2: nuke the index dir to simulate a divergence (crash
+        // between redb commit and tantivy commit, or a manual rm). On
+        // reopen, the index has zero docs but redb still has 5.
+        std::fs::remove_dir_all(&idx_dir).unwrap();
+        std::fs::create_dir_all(&idx_dir).unwrap();
+
+        // Round 3: reopen. The reconciler MUST detect the mismatch and
+        // rebuild the index from redb so search works again.
+        let store = Store::open(&db_path, &idx_dir).unwrap();
+        let hits = store
+            .search("msg-3", 10)
+            .expect("search must work after reconciliation");
+        assert!(
+            !hits.is_empty(),
+            "reconciler did not rebuild the index from redb"
+        );
+    }
+
     #[test]
     fn list_messages_skips_individually_corrupt_entries() {
         let tmp = tempdir().unwrap();
@@ -478,6 +553,11 @@ mod tests {
     proptest::proptest! {
         #![proptest_config(proptest::test_runner::Config {
             cases: 64,  // each case opens redb + tantivy; keep budget modest
+            failure_persistence: Some(Box::new(
+                proptest::test_runner::FileFailurePersistence::SourceParallel(
+                    "proptest-regressions"
+                ),
+            )),
             .. proptest::test_runner::Config::default()
         })]
 

@@ -1112,6 +1112,13 @@ mod tests {
     proptest::proptest! {
         #![proptest_config(proptest::test_runner::Config {
             cases: 256,
+            // See `services::anthropic` for the rationale — commits failed
+            // counterexamples to `proptest-regressions/` so CI can re-run them.
+            failure_persistence: Some(Box::new(
+                proptest::test_runner::FileFailurePersistence::SourceParallel(
+                    "proptest-regressions"
+                ),
+            )),
             .. proptest::test_runner::Config::default()
         })]
 
