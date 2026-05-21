@@ -169,6 +169,18 @@ struct ToolUseAccum {
 /// - `request_id` from the response headers is captured at
 ///   construction and embedded in every error variant — production
 ///   support is unworkable without it.
+///
+/// `cargo fuzz` harnesses reach this type via the `__fuzz` feature.
+/// Not public API.
+#[cfg(feature = "__fuzz")]
+#[doc(hidden)]
+pub fn __fuzz_drive(bytes: &[u8]) {
+    let mut d = AnthropicDecoder::new(None);
+    d.feed(bytes);
+    d.eof();
+    while let Some(_e) = d.next_event() {}
+}
+
 struct AnthropicDecoder {
     buf: crate::services::sse::LineByteBuffer,
     pending: std::collections::VecDeque<Result<ChatEvent, ApiError>>,
@@ -558,7 +570,7 @@ mod tests {
         let events = collect(&mut d);
         let err = events
             .into_iter()
-            .find_map(|e| e.err())
+            .find_map(Result::err)
             .expect("expected a stream error");
         match err {
             ApiError::ProviderStream {
@@ -593,7 +605,7 @@ mod tests {
         );
         let err = events
             .into_iter()
-            .find_map(|e| e.err())
+            .find_map(Result::err)
             .expect("expected a truncation error");
         match err {
             ApiError::StreamTruncated {
@@ -644,7 +656,7 @@ mod tests {
         }
         let err = collect(&mut d)
             .into_iter()
-            .find_map(|e| e.err())
+            .find_map(Result::err)
             .expect("expected error after repeated parse failures");
         assert!(
             matches!(err, ApiError::ProviderStream { .. }),
@@ -815,7 +827,7 @@ mod tests {
         d.feed(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
         let err = collect(&mut d)
             .into_iter()
-            .find_map(|e| e.err())
+            .find_map(Result::err)
             .expect("expected error from malformed tool_use input");
         let s = err.to_string();
         assert!(s.contains("tool_use"), "{s}");
@@ -871,9 +883,44 @@ mod tests {
         assert!(joined.contains("Done"), "{joined}");
     }
 
-    /// Uses a simple LCG so this stays a unit test (no extra dep) and
-    /// rotates through 1000 deterministic seeds — equivalent in coverage
-    /// to a small proptest run.
+    /// Property-tested arbitrary-byte invariance with a proptest-driven
+    /// shrinker. If a counterexample appears, proptest shrinks it to
+    /// the minimal reproducer before reporting — far better than a
+    /// fixed LCG over 1000 seeds (the legacy test below).
+    fn property_anthropic_decoder_never_panics(input: Vec<u8>, chunk_sz: usize) {
+        let chunk = chunk_sz.max(1).min(input.len().max(1));
+        let mut d = AnthropicDecoder::new(None);
+        for chunk_bytes in input.chunks(chunk) {
+            d.feed(chunk_bytes);
+        }
+        d.eof();
+        let mut drained = 0usize;
+        while let Some(_e) = d.next_event() {
+            drained += 1;
+            assert!(drained < 100_000, "decoder over-enqueued events");
+        }
+        d.feed(b"data: x\n");
+        assert!(d.next_event().is_none(), "post-terminal event leaked");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 256,
+            .. proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn anthropic_decoder_never_panics_proptest(
+            input in proptest::collection::vec(proptest::num::u8::ANY, 0..2048),
+            chunk_sz in 1usize..256,
+        ) {
+            property_anthropic_decoder_never_panics(input, chunk_sz);
+        }
+    }
+
+    /// Kept as a deterministic smoke test (CI uses a fixed seed; proptest
+    /// uses an explicit case budget). If proptest is ever removed, this
+    /// preserves the historical 1000-seed coverage floor.
     #[test]
     fn anthropic_decoder_never_panics_on_arbitrary_bytes() {
         fn rng_byte(state: &mut u64) -> u8 {

@@ -50,6 +50,10 @@ plugins = []
 # accept the extra binary size (~200 KB) + first-batch latency cost of the
 # sinc filter table generation.
 hq-resample = ["dep:rubato"]
+# Internal: exposes a `pub mod __fuzz` surface for libFuzzer harnesses
+# in `fuzz/`. Never enabled in production builds; the gated module
+# would be dead code otherwise. Use with `cargo fuzz`.
+__fuzz = []
 
 [dependencies]
 # --- UI ---
@@ -150,6 +154,12 @@ pretty_assertions = "1"
 # disable plotters (no graphviz dep in CI) and keep just the cargo bench
 # integration so `cargo bench` works.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Property-based testing. We use proptest specifically (over quickcheck)
+# because its shrinker is far more aggressive — a counterexample on a
+# 1 KB byte string shrinks to a 3 B reproducer within seconds. Used to
+# prove parser invariants (no panic on arbitrary bytes) and storage
+# round-trip semantics.
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [profile.dev]
 opt-level = 1            # Debug builds still fast enough for UI iteration.

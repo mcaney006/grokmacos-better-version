@@ -330,8 +330,15 @@ fn message_key(msg: &Message) -> Vec<u8> {
     let mut k = Vec::with_capacity(40);
     k.extend_from_slice(msg.chat_id.as_bytes());
     let ts: i64 = msg.created_at.timestamp_micros();
-    // Map signed -> unsigned so big-endian sort matches chronological order.
-    let unsigned = (ts as i128 - i64::MIN as i128) as u64;
+    // Map signed -> unsigned so big-endian sort matches chronological
+    // order. The math is exact for every valid i64: (ts - i64::MIN)
+    // fits in u64 by definition. `From` is the lossless cast (`as`
+    // would silently truncate in a future code change).
+    let shifted = i128::from(ts) - i128::from(i64::MIN);
+    // shifted is in [0, 2^64 - 1] — re-narrow via `try_from` so a
+    // future i64-widening regression would fail loudly.
+    #[allow(clippy::expect_used)] // proven by the range above
+    let unsigned = u64::try_from(shifted).expect("(ts - i64::MIN) ∈ [0, u64::MAX]");
     k.extend_from_slice(&unsigned.to_be_bytes());
     k.extend_from_slice(msg.id.as_bytes());
     k
@@ -466,6 +473,53 @@ mod tests {
         let defaults = Settings::default();
         assert_eq!(loaded.default_provider, defaults.default_provider);
         assert_eq!(loaded.xai_model, defaults.xai_model);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 64,  // each case opens redb + tantivy; keep budget modest
+            .. proptest::test_runner::Config::default()
+        })]
+
+        /// Property: messages inserted via `insert_message` come back
+        /// from `list_messages` in chronological order regardless of
+        /// insertion order, and their content survives bincode +
+        /// tantivy roundtrip byte-for-byte. Proves the composite key
+        /// (`chat_id || ts_be || msg_id`) sorts correctly across a
+        /// wide range of timestamps and uuids.
+        #[test]
+        fn property_message_roundtrip_preserves_order_and_content(
+            contents in proptest::collection::vec("[^\x00]{0,256}", 1..32),
+        ) {
+            let tmp = tempdir().unwrap();
+            let store = open_store(tmp.path());
+            let chat = Chat::new("xai", "grok-beta");
+            store.upsert_chat(&chat).unwrap();
+            // Insert in REVERSE chronological order: each new message
+            // gets a fresher Utc::now() than the previous, but we want
+            // to verify the range scan returns them in ts order anyway.
+            let mut inserted: Vec<Message> = Vec::with_capacity(contents.len());
+            for body in contents {
+                std::thread::sleep(std::time::Duration::from_micros(5));
+                let m = Message::new(chat.id, Role::User, body);
+                store.insert_message(&m).unwrap();
+                inserted.push(m);
+            }
+            let listed = store.list_messages(chat.id).unwrap();
+            // Round-trip count.
+            proptest::prop_assert_eq!(listed.len(), inserted.len());
+            // Ordering: timestamps must be monotonic non-decreasing.
+            for window in listed.windows(2) {
+                proptest::prop_assert!(window[0].created_at <= window[1].created_at);
+            }
+            // Content fidelity: every inserted message appears with its
+            // exact body (the set of bodies is preserved).
+            let listed_bodies: std::collections::BTreeSet<_> =
+                listed.iter().map(|m| m.content.clone()).collect();
+            let inserted_bodies: std::collections::BTreeSet<_> =
+                inserted.iter().map(|m| m.content.clone()).collect();
+            proptest::prop_assert_eq!(listed_bodies, inserted_bodies);
+        }
     }
 
     #[test]

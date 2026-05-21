@@ -411,7 +411,12 @@ impl GrokApp {
                         let _ = self.store.update_message(m);
                     }
                     if let Some(start) = self.stream_started_at.take() {
-                        let elapsed_ms = start.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        // Saturate u128 → u32 via min before truncating.
+                        // `From` would be the lossless way for the
+                        // `u32::MAX` operand but here we need the
+                        // saturating-truncate semantics.
+                        let elapsed_ms =
+                            u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
                         self.stats.last_request_ms = elapsed_ms;
                         let secs = (elapsed_ms.max(1) as f32) / 1000.0;
                         self.stats.tokens_per_sec = self.stream_output_tokens as f32 / secs;

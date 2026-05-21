@@ -1,0 +1,31 @@
+[package]
+name = "grok-insane-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace so the fuzz crate's nightly-only sanitizer
+# requirements don't leak into the main workspace's pinned stable
+# (1.94.0) toolchain. `cargo fuzz run` cds here and resolves locally.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+grok-insane = { path = "..", features = ["__fuzz"] }
+
+[[bin]]
+name = "sse_decoder"
+path = "fuzz_targets/sse_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "anthropic_decoder"
+path = "fuzz_targets/anthropic_decoder.rs"
+test = false
+doc = false
+bench = false

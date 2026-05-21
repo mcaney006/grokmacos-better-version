@@ -590,7 +590,7 @@ impl SincResampler {
                 passthrough: true,
             });
         }
-        let ratio = dst_rate as f64 / src_rate as f64;
+        let ratio = f64::from(dst_rate) / f64::from(src_rate);
         Ok(Self {
             inner: Self::make_inner(ratio)?,
             chunk_size: Self::CHUNK,

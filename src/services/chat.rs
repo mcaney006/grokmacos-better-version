@@ -409,6 +409,19 @@ where
 /// real errors instead of pretending the stream finished cleanly. The UI
 /// already treats `Err` items from the stream as a `StreamMsg::Error` —
 /// the only thing we needed to do was actually emit them.
+///
+/// `cargo fuzz` harnesses reach this type via the `__fuzz` feature
+/// (`crate::services::chat::__fuzz_drive`). Not public API.
+#[cfg(feature = "__fuzz")]
+#[doc(hidden)]
+pub fn __fuzz_drive(bytes: &[u8]) {
+    let mut d = SseDecoder::new(None);
+    d.feed(bytes);
+    d.eof();
+    // Drain; a fuzz iteration must terminate.
+    while let Some(_e) = d.next_event() {}
+}
+
 struct SseDecoder {
     buf: crate::services::sse::LineByteBuffer,
     pending: std::collections::VecDeque<Result<ChatEvent, ApiError>>,
@@ -1074,5 +1087,40 @@ mod tests {
             .expect("error after repeated parse failures")
             .expect_err("expected Err");
         assert!(err.to_string().contains("malformed"), "got {err}");
+    }
+
+    /// Property-tested arbitrary-byte invariants for the OpenAI / xAI
+    /// SSE decoder. Same shape as the Anthropic counterpart: any byte
+    /// sequence, any chunking, must never panic / hang / over-enqueue,
+    /// and post-terminal state stays terminal.
+    fn property_sse_decoder_never_panics(input: Vec<u8>, chunk_sz: usize) {
+        let chunk = chunk_sz.max(1).min(input.len().max(1));
+        let mut d = SseDecoder::new(None);
+        for chunk_bytes in input.chunks(chunk) {
+            d.feed(chunk_bytes);
+        }
+        d.eof();
+        let mut drained = 0usize;
+        while let Some(_e) = d.next_event() {
+            drained += 1;
+            assert!(drained < 100_000, "decoder over-enqueued events");
+        }
+        d.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n");
+        assert!(d.next_event().is_none(), "post-terminal event leaked");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 256,
+            .. proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn sse_decoder_never_panics_proptest(
+            input in proptest::collection::vec(proptest::num::u8::ANY, 0..2048),
+            chunk_sz in 1usize..256,
+        ) {
+            property_sse_decoder_never_panics(input, chunk_sz);
+        }
     }
 }

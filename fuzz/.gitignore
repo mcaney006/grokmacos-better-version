@@ -1,0 +1,11 @@
+target/
+artifacts/
+corpus/sse_decoder/crash-*
+corpus/sse_decoder/oom-*
+corpus/sse_decoder/timeout-*
+corpus/sse_decoder/leak-*
+corpus/anthropic_decoder/crash-*
+corpus/anthropic_decoder/oom-*
+corpus/anthropic_decoder/timeout-*
+corpus/anthropic_decoder/leak-*
+Cargo.lock
