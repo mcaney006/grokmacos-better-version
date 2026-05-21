@@ -88,15 +88,22 @@ impl CiStage {
         match self {
             CiStage::InstallDeps => install_deps(),
             CiStage::Fmt => cargo(["fmt", "--all", "--", "--check"]),
+            // `--locked` catches the case where a developer ran
+            // `cargo add` without committing the resulting Cargo.lock
+            // — without it, clippy/test would silently rewrite the
+            // lockfile in CI and the gate wouldn't notice. Same
+            // reasoning as the features-matrix job in ci.yml which
+            // already uses --locked.
             CiStage::Clippy => cargo([
                 "clippy",
+                "--locked",
                 "--all-targets",
                 "--workspace",
                 "--",
                 "-D",
                 "warnings",
             ]),
-            CiStage::Test => cargo(["test", "--workspace"]),
+            CiStage::Test => cargo(["test", "--workspace", "--locked"]),
             CiStage::Build => dist(),
             CiStage::Audit => audit(),
             CiStage::Sbom => sbom(),
@@ -110,12 +117,25 @@ impl CiStage {
         }
     }
 
+    /// Local `cargo xtask ci` pipeline. Mirrors what the GitHub Actions
+    /// `build` job actually runs: install-deps (linux only) → fmt →
+    /// clippy → nextest → build. We prefer nextest over `cargo test`
+    /// because that's what CI calls (`cargo xtask ci --stage nextest`)
+    /// and the previous default of `Test` left local + CI subtly
+    /// divergent — clippy errors land the same place but a flaky test
+    /// would behave differently under nextest's process isolation than
+    /// under `cargo test`'s shared-process default.
     fn default_pipeline() -> Vec<CiStage> {
         let mut v = Vec::new();
         if cfg!(target_os = "linux") {
             v.push(CiStage::InstallDeps);
         }
-        v.extend([CiStage::Fmt, CiStage::Clippy, CiStage::Test, CiStage::Build]);
+        v.extend([
+            CiStage::Fmt,
+            CiStage::Clippy,
+            CiStage::Nextest,
+            CiStage::Build,
+        ]);
         v
     }
 }
@@ -303,7 +323,15 @@ pub(crate) fn sign_artifacts() -> Result<()> {
 }
 
 fn sign_files_in(dir: &Path) -> Result<u32> {
+    // Files we want a signature next to. Extensions cover binary
+    // archives + DMG + the per-target SBOM. SHA256SUMS has no
+    // extension — match it by exact name because it's the file the
+    // README tells users to `sha256sum -c` against, so a signature
+    // on it is the difference between "you can prove the hashes are
+    // ours" and "you can prove the binaries hash to whatever this
+    // text file claims."
     let signable_exts = ["dmg", "tar.gz", "zip", "json"];
+    let signable_names = ["SHA256SUMS"];
     let mut count = 0u32;
     for entry in std::fs::read_dir(dir).context("read dist dir")? {
         let entry = entry?;
@@ -318,10 +346,11 @@ fn sign_files_in(dir: &Path) -> Result<u32> {
         if name.ends_with(".cosign-bundle") || name == "xtask-metrics.jsonl" {
             continue;
         }
-        let signable = signable_exts
+        let signable_by_ext = signable_exts
             .iter()
             .any(|ext| name.ends_with(&format!(".{ext}")));
-        if !signable {
+        let signable_by_name = signable_names.contains(&name);
+        if !signable_by_ext && !signable_by_name {
             continue;
         }
         let bundle = path.with_extension(format!(

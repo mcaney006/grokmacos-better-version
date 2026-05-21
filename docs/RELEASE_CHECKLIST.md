@@ -97,8 +97,13 @@ gh secret set APPLE_TEAM_ID                       # 10-char Team ID
 gh secret set APPLE_APP_SPECIFIC_PASSWORD        # app-specific pw for notarytool
 ```
 
-The keychain bootstrap step is gated on `env.APPLE_CERTIFICATE_P12_BASE64 != ''`
-so missing secrets fail gracefully (ad-hoc signature) — not catastrophically.
+The keychain bootstrap step runs on every macOS job, then exits early
+inside `run:` if `APPLE_CERTIFICATE_P12_BASE64` is empty. Missing secrets
+fall back to ad-hoc signing (Gatekeeper warns; `right-click → Open` is
+the escape hatch); setting only some of the three required secrets
+(`APPLE_CERTIFICATE_P12_BASE64`, `APPLE_CERTIFICATE_PASSWORD`,
+`KEYCHAIN_PASSWORD`) fails the job loudly so a misconfigured release
+doesn't silently ship unsigned.
 
 ## Yanking a release
 

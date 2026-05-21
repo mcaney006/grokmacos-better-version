@@ -11,16 +11,21 @@ use std::process::Command;
 use std::thread;
 
 pub(crate) fn check() -> Result<()> {
+    // `--locked` mirrors what the CI features-matrix job already does
+    // and catches a developer who ran `cargo add` without committing
+    // Cargo.lock. Without --locked, clippy/test silently regenerate
+    // the lockfile and the local gate is weaker than CI's.
     cargo(["fmt", "--all", "--", "--check"])?;
     cargo([
         "clippy",
+        "--locked",
         "--all-targets",
         "--workspace",
         "--",
         "-D",
         "warnings",
     ])?;
-    cargo(["test", "--workspace"])?;
+    cargo(["test", "--workspace", "--locked"])?;
     Ok(())
 }
 
@@ -31,6 +36,7 @@ pub(crate) fn fmt() -> Result<()> {
 pub(crate) fn lint() -> Result<()> {
     cargo([
         "clippy",
+        "--locked",
         "--all-targets",
         "--workspace",
         "--",
@@ -40,7 +46,7 @@ pub(crate) fn lint() -> Result<()> {
 }
 
 pub(crate) fn test() -> Result<()> {
-    cargo(["test", "--workspace"])
+    cargo(["test", "--workspace", "--locked"])
 }
 
 pub(crate) fn dev(args: &[String]) -> Result<()> {
@@ -307,10 +313,10 @@ pub(crate) fn doctor(args: &[String]) -> Result<()> {
 }
 
 pub(crate) fn preflight() -> Result<()> {
-    println!("== preflight 1/4: cargo xtask check ==");
+    println!("== preflight 1/3: cargo xtask check ==");
     check()?;
 
-    println!("\n== preflight 2/4: cargo xtask audit + sbom (parallel) ==");
+    println!("\n== preflight 2/3: cargo xtask audit + sbom (parallel) ==");
     thread::scope(|s| {
         let h_audit = s.spawn(audit);
         let h_sbom = s.spawn(sbom);
@@ -325,7 +331,7 @@ pub(crate) fn preflight() -> Result<()> {
         anyhow::Ok(())
     })?;
 
-    println!("\n== preflight 4/4: cargo xtask dist ==");
+    println!("\n== preflight 3/3: cargo xtask dist ==");
     dist()?;
     println!("\nAll preflight checks passed. Safe to tag a release.");
     Ok(())

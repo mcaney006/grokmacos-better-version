@@ -95,14 +95,33 @@ jobs:
       # The Apple keychain bootstrap stays as shell — it's a tight sequence
       # of `security` CLI calls that genuinely belong on the runner. No
       # Rust orchestration value to be had by re-wrapping it.
+      #
+      # The previous `if:` checked `env.APPLE_CERTIFICATE_P12_BASE64 != ''`
+      # — but step-level `env:` is not visible to `if:` (the if expression
+      # is evaluated before the step's env block is applied). That meant
+      # the step NEVER ran, even with the secret configured, and every
+      # macOS release silently fell back to ad-hoc signing. Now: gate
+      # only on the OS in `if:`, then test for an empty secret inside
+      # `run:` and skip cleanly there. Secrets aren't allowed in `if:`,
+      # and adding a separate "has-cert" detection step would be more
+      # YAML to misread next time. Honest fix: do the check where the
+      # secret IS available.
       - name: Set up macOS keychain
-        if: startsWith(matrix.os, 'macos') && env.APPLE_CERTIFICATE_P12_BASE64 != ''
+        if: startsWith(matrix.os, 'macos')
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD:   ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD:            ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE_P12_BASE64:-}" ]; then
+            echo "::notice::APPLE_CERTIFICATE_P12_BASE64 not set; macOS build will fall back to ad-hoc signing."
+            exit 0
+          fi
+          if [ -z "${APPLE_CERTIFICATE_PASSWORD:-}" ] || [ -z "${KEYCHAIN_PASSWORD:-}" ]; then
+            echo "::error::APPLE_CERTIFICATE_P12_BASE64 is set but APPLE_CERTIFICATE_PASSWORD or KEYCHAIN_PASSWORD is missing; refusing to attempt signing."
+            exit 1
+          fi
           KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
           echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"

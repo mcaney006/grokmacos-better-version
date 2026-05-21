@@ -22,10 +22,18 @@ We do **not** currently run a bug bounty.
 
 Every release is:
 
-1. Built reproducibly with `SOURCE_DATE_EPOCH` from the tip commit's
-   authored timestamp.
+1. Built with `SOURCE_DATE_EPOCH` exported from the tip commit's
+   authored timestamp (`xtask ci --stage compute-source-date-epoch`).
+   This is a necessary, not sufficient, condition for byte-identical
+   reproducibility — we do not currently re-build the artifact in CI
+   and verify the hashes match. The `cargo xtask reproducible` command
+   runs two clean builds locally and `bail!`s if they diverge; that is
+   what we'd point at to verify the claim end-to-end.
 2. Signed via **Sigstore keyless** (cosign) — verifiable against the
-   public Rekor transparency log.
+   public Rekor transparency log. SHA256SUMS is also signed so the
+   file hashes themselves are anchored to the workflow's OIDC
+   identity, not just trusted by virtue of sitting next to the
+   binaries.
 3. Backed by a **SLSA build-provenance attestation** linking the
    artifact to the exact GitHub Actions run.
 4. Accompanied by a **CycloneDX SBOM** listing every transitive crate
