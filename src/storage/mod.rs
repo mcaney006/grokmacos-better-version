@@ -284,6 +284,26 @@ impl Store {
     // ---- messages -----------------------------------------------------------
 
     pub fn insert_message(&self, message: &Message) -> Result<(), StorageError> {
+        self.write_message(message, /* index */ true)
+    }
+
+    /// Same as `insert_message` but skips the tantivy index write.
+    /// Used by the streaming partial-persist path: we re-write the
+    /// assistant message to redb every ~500 ms with the growing body,
+    /// but indexing a half-streamed message has no search-utility AND
+    /// makes tantivy commit a fresh segment every debounce tick. The
+    /// final `insert_message`/`update_message` call after the stream
+    /// completes does the single index write.
+    pub fn update_message_no_index(&self, message: &Message) -> Result<(), StorageError> {
+        self.write_message(message, /* index */ false)
+    }
+
+    pub fn update_message(&self, message: &Message) -> Result<(), StorageError> {
+        // Same key derivation since the id+chat+ts are stable.
+        self.write_message(message, /* index */ true)
+    }
+
+    fn write_message(&self, message: &Message, index: bool) -> Result<(), StorageError> {
         let bytes = bincode_serialize(message)?;
         let key = message_key(message);
         let write = self.inner.db.begin_write()?;
@@ -292,16 +312,14 @@ impl Store {
             messages.insert(key.as_slice(), bytes.as_slice())?;
         }
         write.commit()?;
-        // Best-effort index. Failure to index must not block message writes.
-        if let Err(e) = self.inner.index.lock().add_message(message) {
-            tracing::warn!(error = %e, "failed to index message");
+        if index {
+            // Best-effort index. Failure to index must not block message
+            // writes — the startup reconciler will pick up the drift.
+            if let Err(e) = self.inner.index.lock().add_message(message) {
+                tracing::warn!(error = %e, "failed to index message");
+            }
         }
         Ok(())
-    }
-
-    pub fn update_message(&self, message: &Message) -> Result<(), StorageError> {
-        // Same key derivation since the id+chat+ts are stable.
-        self.insert_message(message)
     }
 
     pub fn delete_message(&self, message: &Message) -> Result<(), StorageError> {
@@ -460,6 +478,51 @@ mod tests {
         assert!(ids.contains(&good_a.id), "good_a missing");
         assert!(ids.contains(&good_b.id), "good_b missing");
         assert_eq!(listed.len(), 2, "bogus entry should have been skipped");
+    }
+
+    /// `update_message_no_index` persists to redb but skips the
+    /// tantivy commit. Until a subsequent indexed write (or rebuild)
+    /// happens, the message body is INVISIBLE to search. This is
+    /// deliberate — partial-streaming bodies have no search utility
+    /// — so the test pins the contract: redb has the latest body,
+    /// tantivy still has the OLD body (or none), and the next
+    /// `update_message` call re-indexes the final state.
+    #[test]
+    fn update_message_no_index_does_not_publish_to_search_until_indexed_write() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let chat = Chat::new("xai", "grok-beta");
+        store.upsert_chat(&chat).unwrap();
+
+        let mut m = Message::new(chat.id, Role::Assistant, "initial body");
+        store.insert_message(&m).unwrap();
+        // Round 1: indexed write → search finds it.
+        assert!(
+            !store.search("initial", 10).unwrap().is_empty(),
+            "indexed insert must be searchable"
+        );
+
+        // Streaming partial-persist: body grows, but skip the index.
+        m.content = "initial body plus deltas with the word unicorn".into();
+        store.update_message_no_index(&m).unwrap();
+        // "unicorn" should NOT be searchable yet — index still holds
+        // the pre-update body. redb DOES have the new body.
+        assert!(
+            store.search("unicorn", 10).unwrap().is_empty(),
+            "no-index write must NOT publish to search"
+        );
+        let from_redb = &store.list_messages(chat.id).unwrap()[0];
+        assert!(
+            from_redb.content.contains("unicorn"),
+            "redb must have the latest body"
+        );
+
+        // Round 2: the final indexed write at end-of-stream.
+        store.update_message(&m).unwrap();
+        assert!(
+            !store.search("unicorn", 10).unwrap().is_empty(),
+            "final indexed write must publish to search"
+        );
     }
 
     /// Reconciliation: if the search index disagrees with redb at

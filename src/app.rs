@@ -47,6 +47,13 @@ pub struct GrokApp {
     toaster: Toaster,
 
     search_hits: Vec<crate::storage::search::Hit>,
+    /// Search debounce. When the user types in the sidebar search box,
+    /// every keystroke fires a `SidebarAction::Search(q)`. Hitting
+    /// tantivy on each keystroke produces a stair-step of partial
+    /// queries — `"r"`, `"ru"`, `"rus"`, `"rust"` — when only the final
+    /// one is meaningful. We stash the query + when it was last
+    /// changed; the next frame past `SEARCH_DEBOUNCE_MS` executes it.
+    pending_search: Option<(String, Instant)>,
 
     // Streaming state
     stream_rx: Option<UnboundedReceiver<StreamMsg>>,
@@ -135,6 +142,7 @@ impl GrokApp {
             settings_view: settings_view_state,
             toaster: Toaster::default(),
             search_hits: Vec::new(),
+            pending_search: None,
             stream_rx: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             streaming_message_id: None,
@@ -487,7 +495,13 @@ impl GrokApp {
                 }
             }
         }
-        // Debounced persistence of streamed deltas.
+        // Debounced persistence of streamed deltas. We use
+        // `update_message_no_index` here — the message is still being
+        // streamed, indexing each partial body is wasted work (tantivy
+        // commits a new segment per call), and a half-written message
+        // has no search utility. The terminal Done/Error arms above
+        // call `update_message` with the indexing path so the final
+        // body lands in the search index.
         if let Some(id) = dirty_id {
             let now = Instant::now();
             let should_flush = self
@@ -496,7 +510,7 @@ impl GrokApp {
                 .unwrap_or(true);
             if should_flush {
                 if let Some(m) = self.messages.iter().find(|m| m.id == id) {
-                    let _ = self.store.update_message(m);
+                    let _ = self.store.update_message_no_index(m);
                     self.last_stream_persist = Some(now);
                 }
             }
@@ -506,6 +520,24 @@ impl GrokApp {
         } else {
             self.streaming_message_id = None;
             self.chat_view.streaming = false;
+        }
+    }
+
+    /// 200 ms after the user stops typing in the sidebar search box,
+    /// fire the actual tantivy query. Hits per-frame are cheap (one
+    /// Instant comparison) so this lives on the same drain cadence as
+    /// streams + voice.
+    fn drain_pending_search(&mut self) {
+        const SEARCH_DEBOUNCE_MS: u128 = 200;
+        if let Some((ref q, when)) = self.pending_search {
+            if when.elapsed().as_millis() >= SEARCH_DEBOUNCE_MS {
+                let q = q.clone();
+                self.pending_search = None;
+                // 40 is the same per-query cap the old inline call used
+                // — enough to populate the sidebar's "matches in" set
+                // without paging.
+                self.search_hits = self.store.search(&q, 40).unwrap_or_default();
+            }
         }
     }
 
@@ -1153,6 +1185,7 @@ impl eframe::App for GrokApp {
         self.tick_perf();
         self.drain_stream();
         self.drain_voice();
+        self.drain_pending_search();
 
         // Pull live audio level for the waveform.
         if let Some(audio) = self.voice_audio.as_ref() {
@@ -1178,29 +1211,39 @@ impl eframe::App for GrokApp {
                     .stroke(egui::Stroke::new(1.0, theme::BORDER)),
             )
             .show_inside(ui, |ui| {
-                let chats: Vec<Chat> = if self.sidebar.search_text.trim().is_empty() {
-                    self.chats.clone()
+                // Sidebar filter, zero-allocation in the dominant case
+                // (no active search). The previous version did
+                // `self.chats.clone()` every frame even when no search
+                // was active — a full Vec<Chat> + deep-string clone at
+                // 60 Hz, growing linearly with chat count.
+                //
+                // Now: pass the borrowed slice straight through unless
+                // a search is active, in which case we build the
+                // filtered list ONCE per frame with one shared
+                // lowercased needle. The cross-reference set against
+                // `search_hits` is a HashMap keyed by chat_id rather
+                // than the previous O(N²) "any in from_titles" check.
+                let filtered: Vec<Chat>;
+                let chats_view: &[Chat] = if self.sidebar.search_text.trim().is_empty() {
+                    &self.chats
                 } else {
                     let needle = self.sidebar.search_text.to_lowercase();
-                    let mut from_titles: Vec<Chat> = self
-                        .chats
-                        .iter()
-                        .filter(|c| c.title.to_lowercase().contains(&needle))
-                        .cloned()
-                        .collect();
                     let referenced: std::collections::HashSet<Uuid> =
                         self.search_hits.iter().map(|h| h.chat_id).collect();
-                    for c in &self.chats {
-                        if referenced.contains(&c.id) && !from_titles.iter().any(|t| t.id == c.id) {
-                            from_titles.push(c.clone());
-                        }
-                    }
-                    from_titles
+                    filtered = self
+                        .chats
+                        .iter()
+                        .filter(|c| {
+                            referenced.contains(&c.id) || c.title.to_lowercase().contains(&needle)
+                        })
+                        .cloned()
+                        .collect();
+                    &filtered
                 };
                 let action = crate::ui::sidebar::render(
                     ui,
                     &mut self.sidebar,
-                    &chats,
+                    chats_view,
                     self.active_chat,
                     &mut self.toaster,
                 );
@@ -1247,7 +1290,16 @@ impl eframe::App for GrokApp {
                     }
                     SidebarAction::NewChat => self.new_chat(),
                     SidebarAction::Search(q) => {
-                        self.search_hits = self.store.search(&q, 40).unwrap_or_default();
+                        // Don't hit tantivy on every keystroke — debounce.
+                        // `drain_pending_search` (called per frame) fires the
+                        // actual query once typing settles.
+                        if q.trim().is_empty() {
+                            // Clear immediately; no point waiting on empty.
+                            self.search_hits.clear();
+                            self.pending_search = None;
+                        } else {
+                            self.pending_search = Some((q, Instant::now()));
+                        }
                     }
                     SidebarAction::TogglePin(id) => self.toggle_pin(id),
                     SidebarAction::ToggleArchive(id) => self.toggle_archive(id),
