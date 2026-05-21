@@ -1,6 +1,3 @@
-//! Background services: chat completions, voice realtime, audio I/O, search,
-//! and (optionally) local embeddings for RAG.
-
 pub mod anthropic;
 pub mod audio;
 pub mod chat;
@@ -11,3 +8,6 @@ pub mod openai;
 pub mod providers;
 pub mod sse;
 pub mod voice;
+
+#[cfg(test)]
+pub mod tests;
