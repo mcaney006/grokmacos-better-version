@@ -861,6 +861,46 @@ mod tests {
         );
     }
 
+    /// Connect-refused (the most common local-endpoint failure: user
+    /// hasn't started Ollama yet) must produce a CONCISE error
+    /// message, not reqwest's multi-clause wall of text. Production
+    /// support pre-fix saw "error sending request for url
+    /// (http://127.0.0.1:11434/v1/chat/completions): error trying to
+    /// connect: tcp connect error: Connection refused (os error 111)"
+    /// — readable only to engineers.
+    ///
+    /// We bind then immediately drop a listener to grab a port that
+    /// nothing's listening on, then attempt a request. The resulting
+    /// `ApiError::Http(e)` Display must mention "could not reach".
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_connect_refused_renders_human_error() {
+        use tokio::net::TcpListener;
+        // Get a port nobody is listening on.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let dead_url = format!("http://127.0.0.1:{port}");
+
+        let http = http_client(HttpPolicy::LOOPBACK);
+        let err =
+            send_with_rate_limit_retry(&http, &dead_url, &HeaderMap::new(), &serde_json::json!({}))
+                .await
+                .expect_err("connect refused must surface as error");
+
+        let rendered = err.to_string();
+        // The user-facing string must NOT include the reqwest internal
+        // chain prefix ("error sending request for url"). It MUST
+        // include our concise marker.
+        assert!(
+            rendered.contains("could not reach"),
+            "expected concise message, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("error trying to connect"),
+            "reqwest wall-of-text leaked: {rendered}"
+        );
+    }
+
     fn collect_ok(d: &mut SseDecoder) -> Vec<ChatEvent> {
         let mut out = Vec::new();
         while let Some(item) = d.next_event() {

@@ -187,6 +187,30 @@ impl GrokApp {
         if self.streaming_message_id.is_some() {
             return;
         }
+        // Empty + whitespace-only prompts: silently dropped before this
+        // fix, which made `Enter` on an empty composer eat the keypress
+        // with no feedback. Now we tell the user and bail before
+        // allocating a Message / opening a chat row.
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            self.toaster.warn("empty message — type something to send");
+            return;
+        }
+        // Oversize prompts: refuse anything past `MAX_PROMPT_BYTES`. The
+        // real ceiling is the provider's token limit (4k-200k depending
+        // on model), but tokens != bytes and we'd rather fail fast
+        // than ship 4 MB of pasted-clipboard noise across the network.
+        // 256 KiB is comfortably more than any human-typed prompt and
+        // still well below any provider's hard cap.
+        const MAX_PROMPT_BYTES: usize = 256 * 1024;
+        if body.len() > MAX_PROMPT_BYTES {
+            self.toaster.error(format!(
+                "prompt is {} KB — capped at {} KB; trim or split it",
+                body.len() / 1024,
+                MAX_PROMPT_BYTES / 1024,
+            ));
+            return;
+        }
         if self.active_chat.is_none() {
             self.new_chat();
         }
@@ -1013,6 +1037,19 @@ async fn run_completion(
     tx: UnboundedSender<StreamMsg>,
     assistant_id: Uuid,
 ) -> Result<(), ApiError> {
+    // One structured span per stream so production debugging
+    // ("user's stream hung last night at 11pm") has a stable correlation
+    // key. The span fields are `assistant_id`, `provider`, and `model`;
+    // the api_key is deliberately NOT a field (would land in tracing
+    // output as soon as anyone bumped the log level to TRACE).
+    let span = tracing::info_span!(
+        "chat_stream",
+        assistant = %assistant_id,
+        provider = ?provider,
+        model = %request.model,
+    );
+    let _enter = span.enter();
+    tracing::info!(prompt_msgs = request.messages.len(), "stream open");
     let client: Box<dyn ChatProvider + Send + Sync> = match provider {
         Provider::Xai => Box::new(XaiClient::new(api_key)),
         Provider::OpenAi => Box::new(OpenAiClient::new(api_key)),
@@ -1020,7 +1057,12 @@ async fn run_completion(
         Provider::Local => Box::new(LocalClient::new(api_key)),
     };
     let stream = client.stream(request).await?;
+    let started = std::time::Instant::now();
     consume_chat_stream(stream, cancel, tx, assistant_id).await;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "stream closed"
+    );
     Ok(())
 }
 
@@ -1169,6 +1211,30 @@ impl eframe::App for GrokApp {
                         self.refresh_messages();
                     }
                     SidebarAction::Delete(id) => {
+                        // Cancel any in-flight stream targeting the chat
+                        // we're about to delete. Without this, the
+                        // streaming task's debounced `update_message`
+                        // would write the assistant message back to
+                        // redb AFTER the chat row + its message range
+                        // had been removed — creating an orphan
+                        // message that points at a chat_id that no
+                        // longer exists. Tantivy would similarly hold
+                        // a stale entry until the next reindex.
+                        //
+                        // The streaming task observes `cancel_flag` at
+                        // the top of every loop iteration; setting it
+                        // here racing-but-correctly with `delete_chat`
+                        // is enough because the next `consume_chat_stream`
+                        // poll yields `StreamMsg::Done` (the cancelled
+                        // branch) which clears `streaming_message_id`
+                        // via `drain_stream`.
+                        if self.active_chat == Some(id) && self.streaming_message_id.is_some() {
+                            tracing::info!(
+                                chat = %id,
+                                "cancelling in-flight stream because its chat was deleted"
+                            );
+                            self.cancel_flag.store(true, Ordering::SeqCst);
+                        }
                         if let Err(e) = self.store.delete_chat(id) {
                             self.toaster.error(format!("delete failed: {e}"));
                         } else {

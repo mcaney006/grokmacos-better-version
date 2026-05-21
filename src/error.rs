@@ -52,7 +52,15 @@ impl From<tantivy::directory::error::OpenDirectoryError> for StorageError {
 pub enum ApiError {
     #[error("missing api key — set one in settings")]
     MissingKey,
-    #[error("http error: {0}")]
+    // Custom Display because reqwest's own error wall-of-text is a
+    // production support nightmare: "error sending request for url
+    // (http://127.0.0.1:11434/v1/chat/completions): error trying to
+    // connect: tcp connect error: Connection refused (os error 111)".
+    // We render a concise message keyed off the failure mode (connect
+    // failure → "could not reach <host>", timeout → "request timed
+    // out", everything else → "http error: <e>") and keep the original
+    // accessible via the source chain for the developer log.
+    #[error("{}", Self::render_http_error(.0))]
     Http(#[from] reqwest::Error),
     #[error("websocket error: {0}")]
     WebSocket(String),
@@ -99,6 +107,29 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// Render a `reqwest::Error` into a concise, user-facing string.
+    /// Connect-refused, DNS, and timeout errors get crisp messages
+    /// instead of the multi-clause wall of text reqwest produces by
+    /// default. The developer log still has the full chain via the
+    /// `#[source]` chain that `thiserror` wires up.
+    fn render_http_error(e: &reqwest::Error) -> String {
+        if e.is_connect() {
+            let host = e
+                .url()
+                .and_then(|u| u.host_str().map(str::to_owned))
+                .unwrap_or_else(|| "endpoint".to_owned());
+            format!("could not reach {host} — is it running?")
+        } else if e.is_timeout() {
+            "request timed out".to_owned()
+        } else if e.is_request() {
+            format!("request build error: {e}")
+        } else if e.is_decode() {
+            format!("response decode error: {e}")
+        } else {
+            format!("http error: {e}")
+        }
+    }
+
     /// Parse the `Retry-After` header value (RFC 7231 seconds-form only)
     /// into a `Duration`. HTTP-date form returns `None` because providers
     /// don't use it for rate limiting in practice.
