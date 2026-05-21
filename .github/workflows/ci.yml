@@ -24,8 +24,12 @@ env:
   RUST_BACKTRACE: short
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Workflow-wide token floor: read-only. Each job opts in if it needs more.
-permissions: read-all
+# Workflow-wide token floor: contents:read only. `read-all` was wider
+# than necessary (granted read across packages, pull-requests, issues,
+# etc.) and zizmor's excessive-permissions audit flagged it. CI only
+# needs to read source.
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -42,6 +46,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          persist-credentials: false  # CI never pushes; drop stored GITHUB_TOKEN
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
@@ -97,10 +103,14 @@ jobs:
           path: dist/xtask-metrics.jsonl
           if-no-files-found: ignore
 
-  # Feature matrix: prove the code still builds + tests cleanly when
-  # someone flips the optional features on (or strips defaults). Without
-  # this, `--features hq-resample` could rot silently between commits
-  # because the default CI path never exercises it.
+  # Feature matrix: prove the code still builds + tests cleanly across
+  # every meaningful feature configuration. Without this, optional
+  # features rot silently between commits because the default CI path
+  # never exercises them.
+  #
+  # `rag` and `all-features` pull `fastembed -> ort-sys`, which downloads
+  # a pre-built ONNX Runtime tarball at build time. Real GitHub-hosted
+  # runners have the network for this; sandboxed environments may not.
   features:
     name: features (${{ matrix.label }})
     runs-on: ubuntu-latest
@@ -110,10 +120,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { features: "--no-default-features",       label: "no-default-features" }
-          - { features: "--features hq-resample",      label: "hq-resample" }
+          - { features: "--no-default-features",  label: "no-default-features" }
+          - { features: "--features hq-resample", label: "hq-resample" }
+          - { features: "--features rag",         label: "rag" }
+          - { features: "--features hotkeys",     label: "hotkeys" }
+          - { features: "--all-features",         label: "all-features" }
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           toolchain: "1.94.0"
@@ -123,10 +138,27 @@ jobs:
           shared-key: features-${{ matrix.label }}
       - name: install OS deps
         run: cargo xtask ci --stage install-deps
+      # `matrix.features` is repo-controlled but spliced via env to keep
+      # the script template-injection-clean. We DO want word-splitting on
+      # the value ("--features hq-resample" -> two args), so read it into
+      # a bash array via `read -a` instead of relying on unquoted
+      # expansion (which shellcheck would, correctly, complain about).
       - name: clippy
-        run: cargo clippy --workspace --all-targets ${{ matrix.features }} -- -D warnings
+        shell: bash
+        env:
+          CARGO_FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          read -ra args <<<"$CARGO_FEATURES"
+          cargo clippy --workspace --all-targets "${args[@]}" -- -D warnings
       - name: test
-        run: cargo test --workspace ${{ matrix.features }} --locked
+        shell: bash
+        env:
+          CARGO_FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          read -ra args <<<"$CARGO_FEATURES"
+          cargo test --workspace "${args[@]}" --locked
 
   # Doc build catches broken intra-doc links, malformed doctests, and
   # crate-graph misconfiguration. Cheap + high-signal. `RUSTDOCFLAGS=-D
@@ -140,6 +172,8 @@ jobs:
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           toolchain: "1.94.0"

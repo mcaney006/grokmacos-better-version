@@ -38,15 +38,20 @@ env:
   RUST_BACKTRACE: short
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-permissions: read-all
+# Workflow-wide token floor: contents:read only. Each job explicitly opts
+# in to anything more. The previous `read-all` was wider than necessary —
+# zizmor flagged it (excessive-permissions) and it ALSO masked which jobs
+# needed which scopes during review.
+permissions:
+  contents: read
 
 jobs:
   build:
     name: build ${{ matrix.label }}
     permissions:
-      contents: read
-      id-token: write       # OIDC token for Sigstore keyless signing
-      attestations: write   # actions/attest-build-provenance writes here
+      contents: read       # checkout
+      id-token: write      # Sigstore OIDC token for cosign keyless signing
+      attestations: write  # actions/attest-build-provenance target
     environment:
       name: release
     strategy:
@@ -62,14 +67,26 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          # Don't leave the GITHUB_TOKEN in .git/config after checkout.
+          # If we later upload artifacts that include the .git dir, the
+          # token would leak via the artifact. (zizmor: artipacked)
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           toolchain: "1.94.0"
           targets: ${{ matrix.triple }}
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+      # `save-if: "false"` makes this cache strictly read-only on
+      # release runs: we WARM from the CI-built cache but never WRITE
+      # a new entry here, so a poisoned cache layer can't be
+      # introduced by this workflow. zizmor's static check doesn't
+      # parse `save-if`, so the rule is suppressed inline with the
+      # rationale.
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2  # zizmor: ignore[cache-poisoning]
         with:
           shared-key: release-${{ runner.os }}-${{ runner.arch }}
           cache-on-failure: false
+          save-if: "false"
 
       - name: install-deps
         if: matrix.os == 'ubuntu-latest'
@@ -154,12 +171,21 @@ jobs:
       # the job; this is a release, not a smoke test.
       - name: Verify expected artifacts exist
         shell: bash
+        # Matrix values are passed via env, NOT interpolated directly into
+        # the script body. Even though `matrix.*` is repo-controlled (not
+        # attacker-controlled), splicing it into `run:` makes the script
+        # vulnerable to anyone with PR-merge or matrix-write access to
+        # inject shell. Env-var indirection is the standard fix.
+        # (zizmor: template-injection)
+        env:
+          MATRIX_TRIPLE: ${{ matrix.triple }}
+          MATRIX_ARTIFACT: ${{ matrix.artifact }}
         run: |
           set -euo pipefail
-          triple="${{ matrix.triple }}"
+          triple="$MATRIX_TRIPLE"
           missing=()
 
-          case "${{ matrix.artifact }}" in
+          case "$MATRIX_ARTIFACT" in
             tar.gz)
               ls dist/*.tar.gz                          || missing+=("dist/*.tar.gz")
               ;;
@@ -202,11 +228,16 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: write      # softprops/action-gh-release creates the GitHub Release
+      id-token: write      # OIDC scope required by attest-build-provenance
+      attestations: write  # SLSA build-provenance attestation target
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          # No pushes from this job — the release publishes via API
+          # using the implicit GITHUB_TOKEN, NOT via git over the
+          # checkout. Drop the stored credential.
+          persist-credentials: false
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
