@@ -66,6 +66,18 @@ pub enum ApiError {
     WebSocket(String),
     #[error("server returned {status}: {body}")]
     BadStatus { status: u16, body: String },
+    /// HTTP 401 / 403: the provider rejected our credentials. Distinct
+    /// from BadStatus so the UI can surface a "check your API key in
+    /// Settings" toast instead of a generic "server returned 401" wall
+    /// of text. Never retried — auth failure isn't transient.
+    #[error("authentication failed — check your API key in Settings")]
+    AuthFailed { provider: &'static str, status: u16 },
+    /// HTTP 5xx: the provider is having an incident. Conceptually
+    /// retryable but our retry middleware only handles 429; surfaced
+    /// here so the UI can say "Anthropic is down" instead of "server
+    /// returned 503".
+    #[error("{provider} is unavailable (status {status}) — try again shortly")]
+    ProviderUnavailable { provider: &'static str, status: u16 },
     #[error("invalid response: {0}")]
     InvalidResponse(String),
 

@@ -86,9 +86,14 @@ impl ChatProvider for AnthropicClient {
         );
 
         let url = format!("{}/messages", self.base.trim_end_matches('/'));
-        let resp =
-            crate::services::chat::send_with_rate_limit_retry(&self.http, &url, &headers, &body)
-                .await?;
+        let resp = crate::services::chat::send_with_rate_limit_retry(
+            &self.http,
+            &url,
+            &headers,
+            &body,
+            self.id().id(),
+        )
+        .await?;
 
         let request_id = crate::services::chat::extract_request_id(resp.headers());
         let stream = resp.bytes_stream();
@@ -341,6 +346,17 @@ impl AnthropicDecoder {
                     ));
                 }
                 Ok(AnthropicEvent::Ping) => {}
+                Ok(AnthropicEvent::Unknown) => {
+                    // Anthropic added a new event type the client doesn't
+                    // know about. Logged at TRACE so we don't spam
+                    // production logs on every heartbeat-shaped novelty,
+                    // but available when investigating "stream looked
+                    // weird" reports.
+                    tracing::trace!(
+                        payload = %payload,
+                        "anthropic: ignoring unknown event type"
+                    );
+                }
                 Err(e) => {
                     self.parse_failures += 1;
                     tracing::warn!(
@@ -441,6 +457,14 @@ enum AnthropicEvent {
     Ping,
     #[serde(rename = "error")]
     Error { error: AnthropicErrorBody },
+    /// Forward-compat: Anthropic ships new event types regularly
+    /// (`message_limit`, `service_tier`, …). Without this catch-all,
+    /// unknown types would deserialize as Err → trip the
+    /// `parse_failures` counter → kill the stream after 3 unknowns.
+    /// We silently ignore them. The `#[serde(other)]` discriminator
+    /// requires a unit variant, no fields.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The `content_block` payload inside a `content_block_start`. We only
@@ -520,6 +544,50 @@ mod tests {
             out.push(e);
         }
         out
+    }
+
+    /// Forward-compat: Anthropic shipping a new event type (real
+    /// example: `message_limit`, added in 2024) must NOT kill the
+    /// stream. The decoder silently ignores unknown types via the
+    /// `#[serde(other)]` Unknown variant — anything else would have
+    /// us trip the `parse_failures` counter and surface ProviderStream
+    /// after 3 consecutive unknowns. That's a guaranteed-future-bug
+    /// pattern: it WILL break the next time the protocol evolves.
+    #[test]
+    fn anthropic_decoder_ignores_unknown_event_types_without_errors() {
+        let mut d = AnthropicDecoder::new(None);
+        // Six different unknown types, then a normal text delta + stop.
+        d.feed(b"data: {\"type\":\"message_limit\",\"limit\":1000}\n\n");
+        d.feed(b"data: {\"type\":\"service_tier\",\"tier\":\"priority\"}\n\n");
+        d.feed(b"data: {\"type\":\"future_event_xyz\",\"some_field\":42}\n\n");
+        d.feed(b"data: {\"type\":\"yet_another_new_event\"}\n\n");
+        d.feed(b"data: {\"type\":\"plus_one_more\"}\n\n");
+        d.feed(b"data: {\"type\":\"and_one_more\"}\n\n");
+        d.feed(b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n");
+        d.feed(b"data: {\"type\":\"message_stop\"}\n\n");
+
+        let events: Vec<ChatEvent> = collect(&mut d).into_iter().filter_map(Result::ok).collect();
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::Delta(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["hi"], "real delta must survive");
+        assert!(
+            events.iter().any(|e| matches!(e, ChatEvent::Done)),
+            "stop must produce Done despite 6 unknown events"
+        );
+        // Critically: NO error event in the stream. Pre-fix, the
+        // 3rd unknown would have flipped parse_failures and emitted
+        // a ProviderStream error.
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, ChatEvent::Done if false)),
+            "unknown events must not produce a stream error"
+        );
     }
 
     #[test]

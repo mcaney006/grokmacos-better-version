@@ -196,7 +196,8 @@ impl ChatProvider for XaiClient {
         );
 
         let url = format!("{}/chat/completions", self.base.trim_end_matches('/'));
-        let resp = send_with_rate_limit_retry(&self.http, &url, &headers, &body).await?;
+        let resp =
+            send_with_rate_limit_retry(&self.http, &url, &headers, &body, self.id().id()).await?;
 
         let request_id = extract_request_id(resp.headers());
         let stream = resp.bytes_stream();
@@ -277,6 +278,7 @@ pub(crate) async fn send_with_rate_limit_retry<B: serde::Serialize>(
     url: &str,
     headers: &HeaderMap,
     body: &B,
+    provider: &'static str,
 ) -> Result<reqwest::Response, ApiError> {
     let mut attempt = 0usize;
     loop {
@@ -336,10 +338,26 @@ pub(crate) async fn send_with_rate_limit_retry<B: serde::Serialize>(
                 retry_after,
             });
         }
-        let body = read_capped_body(resp).await;
-        return Err(ApiError::BadStatus {
-            status: status.as_u16(),
-            body,
+        let code = status.as_u16();
+        // Classify by HTTP class. Auth failures (401/403) get their own
+        // variant so the UI can say "check your API key" rather than
+        // surfacing the provider's wall-of-text body. 5xx maps to
+        // ProviderUnavailable so the UI can say "Anthropic is down".
+        // Everything else falls through as BadStatus with the (capped)
+        // body for the developer log.
+        return Err(match code {
+            401 | 403 => ApiError::AuthFailed {
+                provider,
+                status: code,
+            },
+            500..=599 => ApiError::ProviderUnavailable {
+                provider,
+                status: code,
+            },
+            _ => {
+                let body = read_capped_body(resp).await;
+                ApiError::BadStatus { status: code, body }
+            }
         });
     }
 }
@@ -709,29 +727,36 @@ mod tests {
 
     /// Adversarial: a hostile / broken upstream that returns a non-success
     /// status with a multi-megabyte body must not let us pull the whole
-    /// thing into memory. The error path uses `resp.text()` to extract a
-    /// diagnostic snippet for the user; without an upstream cap, an
-    /// attacker who returns a 10 GB 500 OOMs the process.
+    /// thing into memory. The error path uses `read_capped_body` to extract
+    /// a diagnostic snippet for the user; without an upstream cap, an
+    /// attacker who returns a 10 GB body OOMs the process.
     ///
-    /// This test plants an 8 MB body behind a 500 status; the surfaced
-    /// `BadStatus.body` must be capped at `MAX_ERROR_BODY_BYTES`.
+    /// We use 418 instead of 500 because 500 now classifies as
+    /// `ProviderUnavailable` (typed UI hint, no body) — the body-cap
+    /// invariant lives on the fall-through BadStatus path, which is
+    /// reached by any 4xx outside 401/403/429.
     #[tokio::test(flavor = "current_thread")]
     async fn bad_status_body_is_capped_against_oom() {
         let huge = "x".repeat(8 * 1024 * 1024);
         let url = spawn_mock_http(vec![MockReply {
-            status: 500,
+            status: 418,
             headers: vec![],
             body: huge,
         }])
         .await;
         let http = http_client(HttpPolicy::LOOPBACK);
-        let err =
-            send_with_rate_limit_retry(&http, &url, &HeaderMap::new(), &serde_json::json!({}))
-                .await
-                .expect_err("500 must surface");
+        let err = send_with_rate_limit_retry(
+            &http,
+            &url,
+            &HeaderMap::new(),
+            &serde_json::json!({}),
+            "test",
+        )
+        .await
+        .expect_err("418 must surface");
         match err {
             ApiError::BadStatus { status, body } => {
-                assert_eq!(status, 500);
+                assert_eq!(status, 418);
                 assert!(
                     body.len() <= MAX_ERROR_BODY_BYTES + 64,
                     "body not capped (len {}, expected <= {})",
@@ -764,7 +789,7 @@ mod tests {
         let http = http_client(HttpPolicy::LOOPBACK);
         let body = serde_json::json!({"hello": "world"});
         let started = std::time::Instant::now();
-        let resp = send_with_rate_limit_retry(&http, &url, &HeaderMap::new(), &body)
+        let resp = send_with_rate_limit_retry(&http, &url, &HeaderMap::new(), &body, "test")
             .await
             .expect("retry should succeed on the second attempt");
         let elapsed = started.elapsed();
@@ -790,10 +815,15 @@ mod tests {
         ];
         let url = spawn_mock_http(responses).await;
         let http = http_client(HttpPolicy::LOOPBACK);
-        let err =
-            send_with_rate_limit_retry(&http, &url, &HeaderMap::new(), &serde_json::json!({}))
-                .await
-                .expect_err("should have surrendered after retry budget");
+        let err = send_with_rate_limit_retry(
+            &http,
+            &url,
+            &HeaderMap::new(),
+            &serde_json::json!({}),
+            "test",
+        )
+        .await
+        .expect_err("should have surrendered after retry budget");
         match err {
             ApiError::RateLimited { retry_after, .. } => {
                 assert_eq!(retry_after, Some(Duration::from_secs(0)));
@@ -819,20 +849,76 @@ mod tests {
         .await;
         let http = http_client(HttpPolicy::LOOPBACK);
         let started = std::time::Instant::now();
-        let err =
-            send_with_rate_limit_retry(&http, &url, &HeaderMap::new(), &serde_json::json!({}))
-                .await
-                .expect_err("500 must surface");
+        let err = send_with_rate_limit_retry(
+            &http,
+            &url,
+            &HeaderMap::new(),
+            &serde_json::json!({}),
+            "test",
+        )
+        .await
+        .expect_err("500 must surface");
         let elapsed = started.elapsed();
         // First-attempt failure: well under one Retry-After cycle.
         assert!(
             elapsed < Duration::from_millis(500),
             "500 was retried (took {elapsed:?})"
         );
+        // 500 now classifies as ProviderUnavailable (the typed variant
+        // the UI knows means "try again shortly"), NOT a generic
+        // BadStatus. Crucially still NOT retried — the test verified
+        // the elapsed time above; this match arm proves the typed
+        // variant ALSO doesn't leak the body in user-facing display
+        // (BadStatus.body could contain provider-side internals).
         match err {
-            ApiError::BadStatus { status, .. } => assert_eq!(status, 500),
-            other => panic!("expected BadStatus, got {other:?}"),
+            ApiError::ProviderUnavailable { status, provider } => {
+                assert_eq!(status, 500);
+                assert_eq!(provider, "test");
+            }
+            other => panic!("expected ProviderUnavailable, got {other:?}"),
         }
+    }
+
+    /// 401 must surface as `AuthFailed`, NOT a generic `BadStatus`.
+    /// The UI taglines "check your API key" off this variant; if it
+    /// drifted back to BadStatus the toast would say "server returned
+    /// 401: <body>" which is operationally useless.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rate_limit_retry_classifies_401_as_auth_failed() {
+        let url = spawn_mock_http(vec![MockReply {
+            status: 401,
+            headers: vec![],
+            body: "Invalid API key".into(),
+        }])
+        .await;
+        let http = http_client(HttpPolicy::LOOPBACK);
+        let err = send_with_rate_limit_retry(
+            &http,
+            &url,
+            &HeaderMap::new(),
+            &serde_json::json!({}),
+            "test",
+        )
+        .await
+        .expect_err("401 must surface");
+        match err {
+            ApiError::AuthFailed { status, provider } => {
+                assert_eq!(status, 401);
+                assert_eq!(provider, "test");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        // Display string must guide the user to settings, NOT leak
+        // the provider's raw body.
+        let s = ApiError::AuthFailed {
+            status: 401,
+            provider: "test",
+        }
+        .to_string();
+        assert!(
+            s.contains("check your API key"),
+            "Display must guide the user, got: {s}"
+        );
     }
 
     /// `extract_request_id` must filter empty / whitespace-only header
@@ -882,10 +968,15 @@ mod tests {
         let dead_url = format!("http://127.0.0.1:{port}");
 
         let http = http_client(HttpPolicy::LOOPBACK);
-        let err =
-            send_with_rate_limit_retry(&http, &dead_url, &HeaderMap::new(), &serde_json::json!({}))
-                .await
-                .expect_err("connect refused must surface as error");
+        let err = send_with_rate_limit_retry(
+            &http,
+            &dead_url,
+            &HeaderMap::new(),
+            &serde_json::json!({}),
+            "test",
+        )
+        .await
+        .expect_err("connect refused must surface as error");
 
         let rendered = err.to_string();
         // The user-facing string must NOT include the reqwest internal
