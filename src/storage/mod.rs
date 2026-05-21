@@ -193,10 +193,31 @@ impl Store {
         let read = self.inner.db.begin_read()?;
         let chats = read.open_table(TBL_CHATS)?;
         let mut out = Vec::new();
+        let mut corrupt = 0u32;
         for item in chats.iter()? {
             let (_, v) = item?;
-            let chat: Chat = bincode_deserialize(v.value())?;
-            out.push(chat);
+            // Skip individually-corrupt entries with a log line rather
+            // than failing the entire list. A bincode schema bump
+            // (Chat::new field) would otherwise lock the user out of
+            // their entire chat history on first launch of a new
+            // build, even though only old entries are unreadable.
+            // Same posture as `load_settings`: log, keep going.
+            match bincode_deserialize::<Chat>(v.value()) {
+                Ok(chat) => out.push(chat),
+                Err(e) => {
+                    corrupt += 1;
+                    tracing::warn!(
+                        error = %e,
+                        "skipping un-decodable chat entry (likely a schema upgrade)"
+                    );
+                }
+            }
+        }
+        if corrupt > 0 {
+            tracing::warn!(
+                count = corrupt,
+                "skipped {corrupt} chat entries that failed to decode"
+            );
         }
         // Newest first, pinned bubble to top.
         out.sort_by(|a, b| {
@@ -247,9 +268,30 @@ impl Store {
         let messages = read.open_table(TBL_MESSAGES)?;
         let (lo, hi) = message_range(chat_id);
         let mut out = Vec::new();
+        let mut corrupt = 0u32;
         for item in messages.range(lo.as_slice()..=hi.as_slice())? {
             let (_, v) = item?;
-            out.push(bincode_deserialize::<Message>(v.value())?);
+            // Same posture as list_chats: skip individually-corrupt
+            // entries rather than fail the whole listing on the first
+            // schema-bump victim.
+            match bincode_deserialize::<Message>(v.value()) {
+                Ok(msg) => out.push(msg),
+                Err(e) => {
+                    corrupt += 1;
+                    tracing::warn!(
+                        error = %e,
+                        %chat_id,
+                        "skipping un-decodable message entry"
+                    );
+                }
+            }
+        }
+        if corrupt > 0 {
+            tracing::warn!(
+                count = corrupt,
+                %chat_id,
+                "skipped {corrupt} message entries that failed to decode"
+            );
         }
         Ok(out)
     }
@@ -322,6 +364,79 @@ mod tests {
 
     fn open_store(dir: &std::path::Path) -> Store {
         Store::open(&dir.join("db.redb"), &dir.join("index")).expect("open")
+    }
+
+    /// Adversarial: a single corrupted chat entry in the table must
+    /// not lock the user out of the entire chat list. The fix logs +
+    /// skips the bad entry and returns the rest. Same posture for
+    /// messages within a chat.
+    #[test]
+    fn list_chats_skips_individually_corrupt_entries() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+
+        // Two real chats, then a bogus blob planted under a synthetic
+        // UUID key. list_chats must surface the two real chats and
+        // skip the corruption.
+        let good_a = Chat::new("xai", "grok-beta");
+        let good_b = Chat::new("anthropic", "claude-3-5-sonnet-latest");
+        store.upsert_chat(&good_a).unwrap();
+        store.upsert_chat(&good_b).unwrap();
+
+        let bogus_id: [u8; 16] = [0x42; 16];
+        let write = store.inner.db.begin_write().unwrap();
+        {
+            let mut chats = write.open_table(TBL_CHATS).unwrap();
+            chats
+                .insert(bogus_id.as_slice(), &[0xFF, 0xFF, 0xFF][..])
+                .unwrap();
+        }
+        write.commit().unwrap();
+
+        let listed = store
+            .list_chats()
+            .expect("corruption must not propagate as error");
+        let ids: std::collections::HashSet<_> = listed.iter().map(|c| c.id).collect();
+        assert!(ids.contains(&good_a.id), "good_a missing");
+        assert!(ids.contains(&good_b.id), "good_b missing");
+        assert_eq!(listed.len(), 2, "bogus entry should have been skipped");
+    }
+
+    /// Mirror of the above for `list_messages` within a chat.
+    #[test]
+    fn list_messages_skips_individually_corrupt_entries() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let chat = Chat::new("xai", "grok-beta");
+        store.upsert_chat(&chat).unwrap();
+
+        let m1 = Message::new(chat.id, Role::User, "hello");
+        let m2 = Message::new(chat.id, Role::Assistant, "world");
+        store.insert_message(&m1).unwrap();
+        store.insert_message(&m2).unwrap();
+
+        // Build a key that falls inside the chat_id range but holds
+        // junk. The key shape is `chat_id (16) || ts_be (8) || msg_id
+        // (16)` — fill the back 24 bytes with 0xAA so it lands cleanly
+        // between m1 / m2 timestamps but won't decode.
+        let mut bogus_key = Vec::with_capacity(40);
+        bogus_key.extend_from_slice(chat.id.as_bytes());
+        bogus_key.resize(40, 0xAA);
+        let write = store.inner.db.begin_write().unwrap();
+        {
+            let mut msgs = write.open_table(TBL_MESSAGES).unwrap();
+            msgs.insert(bogus_key.as_slice(), &[0xFF, 0xFF][..])
+                .unwrap();
+        }
+        write.commit().unwrap();
+
+        let listed = store
+            .list_messages(chat.id)
+            .expect("corruption must not propagate as error");
+        let texts: Vec<&str> = listed.iter().map(|m| m.content.as_str()).collect();
+        assert!(texts.contains(&"hello"), "m1 missing: {texts:?}");
+        assert!(texts.contains(&"world"), "m2 missing: {texts:?}");
+        assert_eq!(listed.len(), 2, "bogus entry should have been skipped");
     }
 
     /// Regression: a corrupted / older-schema Settings blob in redb

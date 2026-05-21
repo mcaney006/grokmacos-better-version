@@ -519,7 +519,19 @@ impl GrokApp {
                 }
                 VoiceEvent::AssistantTextDone => {}
                 VoiceEvent::SpeechStarted | VoiceEvent::SpeechStopped => {}
-                VoiceEvent::Error(e) => self.toaster.error(format!("voice: {e}")),
+                VoiceEvent::Error(e) => {
+                    // An error from any of the WS health paths
+                    // (keepalive ping send failure, uplink send timeout,
+                    // receive watchdog deadline, downlink WS error) means
+                    // the session is no longer usable. Show the toast
+                    // AND tear the session down — leaving voice_active=
+                    // true with a broken WS would let the user think
+                    // they're still recording when nothing's reaching
+                    // the server. UI teardown happens via the same path
+                    // as Closed.
+                    self.toaster.error(format!("voice: {e}"));
+                    closed = true;
+                }
                 VoiceEvent::Closed => {
                     closed = true;
                 }

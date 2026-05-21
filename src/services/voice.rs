@@ -44,6 +44,14 @@ const WS_PING_INTERVAL_SECS: u64 = 30;
 const WS_RECV_WATCHDOG_INTERVAL_SECS: u64 = 60;
 const WS_RECV_DEADLINE_SECS: i64 = 90;
 
+/// Cap on the WebSocket connect + upgrade handshake. Without this an
+/// attacker (or a misbehaving load balancer) that completes the TCP
+/// accept but never speaks HTTP would hang `connect_async().await`
+/// forever, leaking the spawned voice-open task and pinning resources
+/// for the entire process lifetime. Matches the HTTP `connect_timeout`
+/// in `services::chat::http_client` (10s).
+const WS_CONNECT_TIMEOUT_SECS: u64 = 10;
+
 /// Per-`sink.send()` cap on the uplink. The receive watchdog catches
 /// the case where the server stops sending; this catches the inverse
 /// (server keeps the socket open but stops reading, so our writes
@@ -110,9 +118,21 @@ impl VoiceSession {
             )?,
         );
 
-        let (ws, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| ApiError::WebSocket(e.to_string()))?;
+        let connect_fut = tokio_tungstenite::connect_async(request);
+        let (ws, _) = match tokio::time::timeout(
+            std::time::Duration::from_secs(WS_CONNECT_TIMEOUT_SECS),
+            connect_fut,
+        )
+        .await
+        {
+            Ok(Ok(ok)) => ok,
+            Ok(Err(e)) => return Err(ApiError::WebSocket(e.to_string())),
+            Err(_elapsed) => {
+                return Err(ApiError::WebSocket(format!(
+                    "websocket connect timed out after {WS_CONNECT_TIMEOUT_SECS}s (handshake never completed)"
+                )));
+            }
+        };
         let (mut sink, mut stream) = ws.split();
 
         let config = serde_json::json!({
@@ -472,6 +492,60 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         format!("ws://127.0.0.1:{port}/")
+    }
+
+    /// Adversarial: a server that ACCEPTS the TCP connection but never
+    /// completes the WebSocket upgrade handshake. Without a connect
+    /// timeout, `connect_async().await` would block indefinitely and
+    /// leak the spawned voice-open task. The fix wraps connect_async
+    /// in a `tokio::time::timeout` with the same budget as the HTTP
+    /// connect_timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_open_with_url_times_out_on_hung_handshake() {
+        // Listener accepts TCP but never sends an HTTP response — the
+        // client should give up via the new connect timeout rather than
+        // hang forever.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Accept and HOLD the socket forever. Never read, never write.
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                drop(stream);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let url = format!("ws://127.0.0.1:{port}/");
+
+        // Run with a `tokio::time::timeout` that's WIDER than the
+        // internal connect timeout so we can tell whether the system
+        // gave up on its own (good) or we had to bail out (bad).
+        let outer = tokio::time::timeout(
+            Duration::from_secs(WS_CONNECT_TIMEOUT_SECS + 5),
+            VoiceSession::open_with_url(
+                &url,
+                "dummy-key".into(),
+                VoicePersona::Ara,
+                dummy_shared(),
+            ),
+        )
+        .await;
+
+        match outer {
+            Ok(Err(ApiError::WebSocket(msg))) => {
+                assert!(
+                    msg.contains("timed out") || msg.contains("timeout") || msg.contains("connect"),
+                    "expected websocket-connect timeout, got: {msg}"
+                );
+            }
+            Ok(Ok(_session)) => panic!("connection should NOT have succeeded"),
+            Ok(Err(other)) => panic!("expected ApiError::WebSocket, got {other:?}"),
+            Err(_elapsed) => {
+                panic!(
+                    "VoiceSession::open_with_url never returned — internal connect timeout missing or wrong"
+                );
+            }
+        }
     }
 
     /// When the server closes the TCP connection mid-session, the next
