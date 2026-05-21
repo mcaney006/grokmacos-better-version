@@ -139,30 +139,93 @@ impl Store {
         Ok(())
     }
 
+    /// Apply schema migrations from the on-disk version up to
+    /// `CURRENT_SCHEMA_VERSION`. The previous version was a stub that
+    /// only stamped the version key — any future schema change would
+    /// have been silently accepted, leaving callers reading stale-
+    /// shaped data through bincode.
+    ///
+    /// Migration contract:
+    ///   * Fresh DB (no version key) starts at version 0; migrate
+    ///     forward through every intermediate.
+    ///   * Each `Self::migrate_to_v<N>` is responsible for transforming
+    ///     `v<N-1>` data into `v<N>` shape. Today there's only one
+    ///     (v0 → v1) and it's a no-op because the schema hasn't
+    ///     changed since launch.
+    ///   * A version GREATER than `CURRENT_SCHEMA_VERSION` (user
+    ///     downgraded the app) is REFUSED rather than silently
+    ///     accepted — bincode is positional, a newer schema's bytes
+    ///     would deserialise as garbage. Returns `StorageError::Decode`.
+    ///   * Migration failure rolls back via redb's transaction
+    ///     semantics: the version key only stamps on the same write
+    ///     transaction that ran the migration.
     fn migrate(&self) -> Result<(), StorageError> {
+        let current = self.read_schema_version()?;
+        if current > CURRENT_SCHEMA_VERSION {
+            return Err(StorageError::Decode(format!(
+                "on-disk schema version {current} is newer than this build's max {CURRENT_SCHEMA_VERSION}; \
+                 downgrade is not supported, install a newer build or wipe local data"
+            )));
+        }
+        // Run migrations sequentially. Each migration is its own
+        // transaction so a failure at step N leaves the DB at v<N-1>
+        // and the next launch retries cleanly.
+        for target in (current + 1)..=CURRENT_SCHEMA_VERSION {
+            tracing::info!(from = current, to = target, "running schema migration");
+            self.migrate_to(target)?;
+        }
+        // First-launch path: ensure tables exist even when no migration
+        // was applied. Touching them inside a write txn is idempotent.
         let write = self.inner.db.begin_write()?;
         {
-            let mut meta = write.open_table(TBL_META)?;
-            // Touch the chats/messages tables so they exist before any read txn.
+            write.open_table(TBL_META)?;
             write.open_table(TBL_CHATS)?;
             write.open_table(TBL_MESSAGES)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
 
-            let current = meta
-                .get(META_SCHEMA_VERSION)?
-                .and_then(|v| {
-                    let bytes = v.value();
-                    if bytes.len() == 4 {
-                        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0);
-            if current != CURRENT_SCHEMA_VERSION {
-                meta.insert(
-                    META_SCHEMA_VERSION,
-                    &CURRENT_SCHEMA_VERSION.to_be_bytes()[..],
-                )?;
+    fn read_schema_version(&self) -> Result<u32, StorageError> {
+        let read = self.inner.db.begin_read()?;
+        let meta = match read.open_table(TBL_META) {
+            Ok(t) => t,
+            // First launch: table doesn't exist yet. Treat as v0.
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(StorageError::Table(e)),
+        };
+        Ok(meta
+            .get(META_SCHEMA_VERSION)?
+            .and_then(|v| {
+                let bytes = v.value();
+                if bytes.len() == 4 {
+                    Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0))
+    }
+
+    /// Dispatch one step of the migration ladder. New schema bumps add
+    /// a match arm here AND bump `CURRENT_SCHEMA_VERSION`.
+    fn migrate_to(&self, target: u32) -> Result<(), StorageError> {
+        let write = self.inner.db.begin_write()?;
+        match target {
+            1 => {
+                // v0 → v1: no shape change. We didn't have version
+                // stamping until v1, so any pre-existing DB without a
+                // version key is by definition v0 with the current
+                // shape. Stamping is the only work.
+                {
+                    let mut meta = write.open_table(TBL_META)?;
+                    meta.insert(META_SCHEMA_VERSION, &1u32.to_be_bytes()[..])?;
+                }
+            }
+            other => {
+                return Err(StorageError::Decode(format!(
+                    "no migration defined for target schema version {other}"
+                )));
             }
         }
         write.commit()?;
@@ -322,6 +385,25 @@ impl Store {
         Ok(())
     }
 
+    /// Delete a message from canonical storage and best-effort from
+    /// the search index. Symmetric with `insert_message`: a tantivy
+    /// failure logs at WARN and the function still returns Ok,
+    /// because:
+    ///   1. redb has already committed the delete — that's the source
+    ///      of truth.
+    ///   2. The startup reconciler in `reconcile_index_on_startup`
+    ///      compares `redb.count_messages` vs `tantivy.doc_count`; an
+    ///      orphan tantivy entry shows up as count_index > count_redb
+    ///      and triggers a full rebuild.
+    ///   3. Until the next launch, search may surface a deleted
+    ///      message in the hit list. The hit's `msg_id` would resolve
+    ///      to nothing in `list_messages`, so the UI sees an empty
+    ///      result — annoying but not corrupting.
+    ///
+    /// The previous version propagated the tantivy error as an Err,
+    /// which left the redb state inconsistent with the function's
+    /// reported outcome (deleted from canonical but caller saw a
+    /// failure).
     pub fn delete_message(&self, message: &Message) -> Result<(), StorageError> {
         let key = message_key(message);
         let write = self.inner.db.begin_write()?;
@@ -330,7 +412,13 @@ impl Store {
             messages.remove(key.as_slice())?;
         }
         write.commit()?;
-        self.inner.index.lock().delete_message(message.id)?;
+        if let Err(e) = self.inner.index.lock().delete_message(message.id) {
+            tracing::warn!(
+                error = %e,
+                msg_id = %message.id,
+                "failed to delete from search index; startup reconciler will rebuild"
+            );
+        }
         Ok(())
     }
 
@@ -745,6 +833,121 @@ mod tests {
             store.search("ephemeral", 5).unwrap().is_empty(),
             "deleted message must vanish from the search index"
         );
+    }
+
+    /// Schema downgrade refusal: if the on-disk version is GREATER
+    /// than `CURRENT_SCHEMA_VERSION`, `Store::open` must refuse
+    /// rather than blithely proceed. bincode is positional — silently
+    /// accepting a newer schema's bytes would deserialise into
+    /// `Settings`/`Chat`/`Message` with the wrong field shape, which
+    /// at best produces noise and at worst nukes user data on the
+    /// next write.
+    ///
+    /// The previous `migrate()` stub stamped the current version
+    /// unconditionally and would have happily downgraded.
+    #[test]
+    fn open_refuses_to_downgrade_from_a_newer_schema() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("db.redb");
+        let idx_dir = tmp.path().join("idx");
+
+        // Bootstrap a normal store at the current version.
+        {
+            let store = Store::open(&db_path, &idx_dir).expect("first open");
+            drop(store);
+        }
+
+        // Plant a future version directly into the META table,
+        // bypassing migrate(). This simulates a user opening an old
+        // build against a database written by a newer build.
+        {
+            let db = redb::Database::open(&db_path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut meta = write.open_table(TBL_META).unwrap();
+                let future: u32 = CURRENT_SCHEMA_VERSION + 17;
+                meta.insert(META_SCHEMA_VERSION, &future.to_be_bytes()[..])
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        // Re-open: must refuse with a Decode error that names the
+        // version. Don't pattern-match the message verbatim — pin
+        // the variant and the substrings a user would actually see.
+        match Store::open(&db_path, &idx_dir) {
+            Ok(_) => panic!("downgrade must refuse to open"),
+            Err(StorageError::Decode(msg)) => {
+                assert!(
+                    msg.contains("newer than this build"),
+                    "error must explain the downgrade refusal: {msg}"
+                );
+                assert!(
+                    msg.contains(&(CURRENT_SCHEMA_VERSION + 17).to_string()),
+                    "error must surface the offending version: {msg}"
+                );
+            }
+            Err(other) => panic!("expected StorageError::Decode, got {other:?}"),
+        }
+    }
+
+    /// `delete_message` is symmetric with `insert_message`: redb is
+    /// canonical, tantivy is derived. A tantivy delete that finds
+    /// no matching term is a no-op for that crate (it's idempotent
+    /// — `delete_term` returns the count of deleted docs but never
+    /// errors on miss), so calling delete_message on a message that
+    /// was NEVER indexed must still return Ok and remove the redb
+    /// entry. The previous version propagated tantivy errors,
+    /// which left callers thinking a delete failed when canonical
+    /// state had already updated.
+    #[test]
+    fn delete_message_returns_ok_when_search_index_has_no_entry() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let chat = Chat::new("xai", "grok-beta");
+        store.upsert_chat(&chat).unwrap();
+
+        // Write a message through the no-index path: redb gets it,
+        // tantivy does NOT. Simulates a stream that was persisted
+        // mid-flight and then aborted before the final commit.
+        let m = Message::new(chat.id, Role::User, "never-indexed body");
+        store.update_message_no_index(&m).unwrap();
+        assert_eq!(store.list_messages(chat.id).unwrap().len(), 1);
+        assert!(
+            store.search("never-indexed", 5).unwrap().is_empty(),
+            "precondition: this message is not in the search index"
+        );
+
+        // delete_message must succeed and clear the redb side, even
+        // though tantivy never had this msg_id to delete.
+        store.delete_message(&m).expect(
+            "delete must be best-effort against the index — \
+             canonical (redb) success is what callers observe",
+        );
+        assert!(
+            store.list_messages(chat.id).unwrap().is_empty(),
+            "redb is canonical: the message must be gone"
+        );
+    }
+
+    /// Migration ladder: `migrate_to` is the only place schema
+    /// transformations land. Calling it with a version this build
+    /// doesn't know about must return Decode, not panic or silently
+    /// succeed.
+    #[test]
+    fn migrate_to_refuses_unknown_target_version() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let err = store
+            .migrate_to(9999)
+            .expect_err("unknown migration target must Err");
+        match err {
+            StorageError::Decode(msg) => assert!(
+                msg.contains("9999"),
+                "error must name the unknown target: {msg}"
+            ),
+            other => panic!("expected Decode, got {other:?}"),
+        }
     }
 
     #[test]

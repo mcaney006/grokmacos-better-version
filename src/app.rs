@@ -912,12 +912,18 @@ impl GrokApp {
                 return;
             }
         }
-        match std::fs::write(&dest, body) {
+        // Atomic export — see `crate::paths::atomic_write_bytes` for
+        // contract. The prior code path used `std::fs::write(&dest, …)`
+        // which truncates `dest` at write start; an interrupted write
+        // destroyed the user's previous successful export. With this
+        // helper, a crash mid-write leaves the `.partial` orphaned but
+        // the prior `dest` (if any) untouched.
+        match crate::paths::atomic_write_bytes(&dest, body.as_bytes()) {
             Ok(()) => {
                 let display = dest.display();
                 self.toaster.info(format!("exported to {display}"));
             }
-            Err(e) => self.toaster.error(format!("write: {e}")),
+            Err(e) => self.toaster.error(format!("export: {e}")),
         }
     }
 
