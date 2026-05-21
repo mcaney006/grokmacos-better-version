@@ -139,7 +139,7 @@ fn build_input_stream(
     let config: StreamConfig = supported.into();
 
     let resampler = if native_rate != VOICE_SAMPLE_RATE {
-        Some(Arc::new(Mutex::new(LinearResampler::new(
+        Some(Arc::new(Mutex::new(VoiceResampler::new(
             native_rate as f32,
             VOICE_SAMPLE_RATE as f32,
         ))))
@@ -239,7 +239,7 @@ fn build_output_stream(
 
     let ring = Arc::new(Mutex::new(RingBuffer::new()));
     let resampler = if native_rate != VOICE_SAMPLE_RATE {
-        Some(Arc::new(Mutex::new(LinearResampler::new(
+        Some(Arc::new(Mutex::new(VoiceResampler::new(
             VOICE_SAMPLE_RATE as f32,
             native_rate as f32,
         ))))
@@ -431,7 +431,43 @@ impl RingBuffer {
     }
 }
 
-struct LinearResampler {
+/// Resampler used by both capture (native→24 kHz) and playback (24 kHz→
+/// native) pipelines. Always-on lightweight linear interpolator by
+/// default; sinc-interpolated (rubato) under `--features hq-resample`.
+///
+/// Both variants expose the same `process(&[f32]) -> Vec<f32>` shape so
+/// the call sites in `build_input_stream` / `build_output_stream` don't
+/// branch on the implementation.
+pub(crate) enum VoiceResampler {
+    Linear(LinearResampler),
+    #[cfg(feature = "hq-resample")]
+    Sinc(SincResampler),
+}
+
+impl VoiceResampler {
+    pub(crate) fn new(src_rate: f32, dst_rate: f32) -> Self {
+        #[cfg(feature = "hq-resample")]
+        {
+            match SincResampler::new(src_rate, dst_rate) {
+                Ok(s) => return VoiceResampler::Sinc(s),
+                Err(e) => {
+                    tracing::warn!(error = %e, "rubato init failed, falling back to linear");
+                }
+            }
+        }
+        VoiceResampler::Linear(LinearResampler::new(src_rate, dst_rate))
+    }
+
+    pub(crate) fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        match self {
+            VoiceResampler::Linear(r) => r.process(input),
+            #[cfg(feature = "hq-resample")]
+            VoiceResampler::Sinc(r) => r.process(input),
+        }
+    }
+}
+
+pub(crate) struct LinearResampler {
     src_rate: f32,
     dst_rate: f32,
     last_sample: f32,
@@ -439,7 +475,7 @@ struct LinearResampler {
 }
 
 impl LinearResampler {
-    fn new(src_rate: f32, dst_rate: f32) -> Self {
+    pub(crate) fn new(src_rate: f32, dst_rate: f32) -> Self {
         Self {
             src_rate,
             dst_rate,
@@ -448,7 +484,7 @@ impl LinearResampler {
         }
     }
 
-    fn process(&mut self, input: &[f32]) -> Vec<f32> {
+    pub(crate) fn process(&mut self, input: &[f32]) -> Vec<f32> {
         if input.is_empty() || (self.src_rate - self.dst_rate).abs() < f32::EPSILON {
             return input.to_vec();
         }
@@ -471,5 +507,156 @@ impl LinearResampler {
             self.last_sample = *last;
         }
         out
+    }
+}
+
+// --- sinc-interpolated resampler (rubato) ----------------------------------
+//
+// Only compiled when `--features hq-resample` is active. Wraps rubato's
+// `SincFixedIn` resampler in a streaming front-end that matches the
+// shape of `LinearResampler::process`: append-only, takes whatever's
+// available, returns whatever the engine can emit.
+//
+// rubato's `SincFixedIn` expects a fixed input block size per call and
+// returns a fixed number of output samples. To plug it into cpal's
+// arbitrary-sized callback frames we keep an internal byte-rate input
+// queue, pull `chunk_size` samples at a time, and concatenate the
+// output. Anything that doesn't divide evenly stays in the queue for
+// the next call — same backpressure pattern as the line buffer in
+// `services::sse`.
+
+#[cfg(feature = "hq-resample")]
+pub(crate) struct SincResampler {
+    inner: rubato::SincFixedIn<f32>,
+    chunk_size: usize,
+    queue: std::collections::VecDeque<f32>,
+    /// Identity-only pass-through when src == dst; rubato refuses an
+    /// identity ratio (the sinc kernel is undefined) so we short-circuit
+    /// here rather than ask rubato to do nothing slowly.
+    passthrough: bool,
+}
+
+#[cfg(feature = "hq-resample")]
+impl SincResampler {
+    /// Chunk size for the sinc engine. 256 samples @ 24 kHz = 10.7 ms;
+    /// large enough that the per-call overhead is amortised, small
+    /// enough that voice latency doesn't grow visibly.
+    const CHUNK: usize = 256;
+
+    pub(crate) fn new(src_rate: f32, dst_rate: f32) -> Result<Self, String> {
+        if (src_rate - dst_rate).abs() < f32::EPSILON {
+            return Ok(Self {
+                inner: Self::make_inner(1.0)?,
+                chunk_size: Self::CHUNK,
+                queue: std::collections::VecDeque::new(),
+                passthrough: true,
+            });
+        }
+        let ratio = dst_rate as f64 / src_rate as f64;
+        Ok(Self {
+            inner: Self::make_inner(ratio)?,
+            chunk_size: Self::CHUNK,
+            queue: std::collections::VecDeque::new(),
+            passthrough: false,
+        })
+    }
+
+    fn make_inner(ratio: f64) -> Result<rubato::SincFixedIn<f32>, String> {
+        use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+        let params = SincInterpolationParameters {
+            // f_cutoff = 0.95: standard anti-alias margin below Nyquist.
+            // sinc_len = 256: ample stopband attenuation, ~5 ms of pre-ring.
+            // oversampling_factor = 256, interpolation = Linear: smooth
+            // ratio without an explosive kernel size.
+            sinc_len: 256,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 256,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        // SincFixedIn::new(ratio, max_resample_ratio_relative, params, chunk_size, channels)
+        SincFixedIn::<f32>::new(ratio, 2.0, params, Self::CHUNK, 1).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        if self.passthrough {
+            return input.to_vec();
+        }
+        self.queue.extend(input.iter().copied());
+        let mut out: Vec<f32> = Vec::new();
+        // Pull full chunks until the queue can't satisfy one more.
+        while self.queue.len() >= self.chunk_size {
+            let mut buf = Vec::with_capacity(self.chunk_size);
+            for _ in 0..self.chunk_size {
+                if let Some(s) = self.queue.pop_front() {
+                    buf.push(s);
+                }
+            }
+            use rubato::Resampler;
+            match self.inner.process(&[buf], None) {
+                Ok(frames) => {
+                    if let Some(ch) = frames.into_iter().next() {
+                        out.extend(ch);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "rubato process failed; dropping chunk");
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Identical sample rates must be a strict pass-through under both
+    /// resampler backends. Guards against introducing any phase / delay
+    /// in the trivial identity case (which the rubato sinc engine refuses
+    /// to handle directly — the wrapper short-circuits it).
+    #[test]
+    fn voice_resampler_identity_rate_is_passthrough() {
+        let mut r = VoiceResampler::new(24_000.0, 24_000.0);
+        let input: Vec<f32> = (0..1024).map(|i| (i as f32 / 100.0).sin()).collect();
+        let out = r.process(&input);
+        assert_eq!(out.len(), input.len(), "identity rate must preserve length");
+        for (i, (a, b)) in input.iter().zip(out.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "identity rate must preserve sample {i}: {a} vs {b}"
+            );
+        }
+    }
+
+    /// Downsampling 48 kHz → 24 kHz must produce roughly half the output
+    /// samples. Exact count varies by engine (the sinc resampler buffers
+    /// internally until it has a full chunk), so we only assert the ratio
+    /// after a warm-up that's well past the initial sinc latency.
+    #[test]
+    fn voice_resampler_downsample_ratio_is_approximately_half() {
+        let mut r = VoiceResampler::new(48_000.0, 24_000.0);
+        // 4 seconds of audio so the sinc engine has plenty of room to
+        // emit chunks past its initial latency.
+        let input: Vec<f32> = (0..192_000).map(|i| (i as f32 * 0.01).sin()).collect();
+        let out = r.process(&input);
+        let ratio = out.len() as f32 / input.len() as f32;
+        assert!(
+            (0.45..=0.55).contains(&ratio),
+            "expected ~0.5 downsample ratio, got {ratio} ({} -> {})",
+            input.len(),
+            out.len()
+        );
+    }
+
+    /// Process must never panic on an empty input slice (cpal occasionally
+    /// hands the callback a zero-length buffer during stream start-up).
+    #[test]
+    fn voice_resampler_handles_empty_input() {
+        let mut r = VoiceResampler::new(48_000.0, 24_000.0);
+        let out = r.process(&[]);
+        assert!(out.is_empty());
     }
 }

@@ -137,21 +137,37 @@ where
 /// See the same constant in `chat.rs` for rationale.
 const ANTHROPIC_PARSE_FAILURE_LIMIT: u32 = 3;
 
+/// Per-content-block accumulator for a streaming tool call. Anthropic
+/// sends `tool_use` blocks as: one `content_block_start` (with id+name),
+/// N `content_block_delta` frames each carrying an `input_json_delta`
+/// fragment of the input JSON, and one `content_block_stop`. We assemble
+/// the fragments here and emit a single `ChatEvent::ToolUse` at stop time.
+#[derive(Debug)]
+struct ToolUseAccum {
+    id: String,
+    name: String,
+    /// Concatenated `partial_json` fragments. May be `""` if the tool's
+    /// input schema has no required fields and the model emits nothing
+    /// — that's a valid case, parsed below as `{}`.
+    partial: String,
+}
+
 /// Anthropic SSE decoder.
 ///
 /// Failure model — what changed from the original version:
-/// * The queue is `VecDeque<Result<ChatEvent, ApiError>>`, not just
+///
+/// - The queue is `VecDeque<Result<ChatEvent, ApiError>>`, not just
 ///   `VecDeque<ChatEvent>`. This is what lets us surface provider
 ///   `error` events as actual errors instead of pretending they were
 ///   empty content deltas.
-/// * `eof()` without a `message_stop` is a `StreamTruncated` error,
+/// - `eof()` without a `message_stop` is a `StreamTruncated` error,
 ///   not a synthetic `Done`. A dropped connection no longer looks like
 ///   a clean completion.
-/// * Repeated JSON parse failures escalate to a `ProviderStream` error
+/// - Repeated JSON parse failures escalate to a `ProviderStream` error
 ///   after `ANTHROPIC_PARSE_FAILURE_LIMIT` strikes. Either the
 ///   protocol drifted or the upstream is malicious; either way silent
 ///   loss is the wrong answer.
-/// * `request_id` from the response headers is captured at
+/// - `request_id` from the response headers is captured at
 ///   construction and embedded in every error variant — production
 ///   support is unworkable without it.
 struct AnthropicDecoder {
@@ -162,6 +178,9 @@ struct AnthropicDecoder {
     output_tokens: u32,
     parse_failures: u32,
     request_id: Option<String>,
+    /// In-flight tool-use blocks keyed by `content_block_delta.index`.
+    /// Indexes are u32 — Anthropic uses contiguous small integers.
+    tool_blocks: std::collections::HashMap<u32, ToolUseAccum>,
 }
 
 impl AnthropicDecoder {
@@ -174,6 +193,7 @@ impl AnthropicDecoder {
             output_tokens: 0,
             parse_failures: 0,
             request_id,
+            tool_blocks: std::collections::HashMap::new(),
         }
     }
 
@@ -202,12 +222,72 @@ impl AnthropicDecoder {
             };
             let payload = rest.trim_start();
             match serde_json::from_str::<AnthropicEvent>(payload) {
-                Ok(AnthropicEvent::ContentBlockDelta { delta }) => match delta {
+                Ok(AnthropicEvent::ContentBlockStart {
+                    index,
+                    content_block,
+                }) => {
+                    if let AnthropicContentBlock::ToolUse { id, name } = content_block {
+                        // Begin accumulating partial_json for this block.
+                        // We don't emit anything yet — the input isn't
+                        // ready until content_block_stop.
+                        self.tool_blocks.insert(
+                            index,
+                            ToolUseAccum {
+                                id,
+                                name,
+                                partial: String::new(),
+                            },
+                        );
+                    }
+                }
+                Ok(AnthropicEvent::ContentBlockDelta { index, delta }) => match delta {
                     AnthropicDelta::TextDelta { text } if !text.is_empty() => {
                         self.pending.push_back(Ok(ChatEvent::Delta(text)));
                     }
+                    AnthropicDelta::InputJsonDelta { partial_json } => {
+                        if let Some(accum) = self.tool_blocks.get_mut(&index) {
+                            accum.partial.push_str(&partial_json);
+                        }
+                        // If no accumulator exists for this index, the
+                        // server emitted an input_json_delta without a
+                        // content_block_start of type tool_use. That's a
+                        // wire-protocol violation we silently ignore
+                        // rather than crash — same posture as other
+                        // unknown shapes (AnthropicDelta::Other).
+                    }
                     _ => {}
                 },
+                Ok(AnthropicEvent::ContentBlockStop { index }) => {
+                    if let Some(accum) = self.tool_blocks.remove(&index) {
+                        // Empty partial means "no fields" — that's a valid
+                        // call with an empty input object, e.g. a tool
+                        // that takes no arguments.
+                        let raw = if accum.partial.is_empty() {
+                            "{}".to_string()
+                        } else {
+                            accum.partial
+                        };
+                        match serde_json::from_str::<serde_json::Value>(&raw) {
+                            Ok(input) => {
+                                self.pending.push_back(Ok(ChatEvent::ToolUse {
+                                    id: accum.id,
+                                    name: accum.name,
+                                    input,
+                                }));
+                            }
+                            Err(e) => {
+                                // Partial JSON didn't form a valid object
+                                // — surface a typed error rather than
+                                // silently dropping the tool call.
+                                self.push_provider_error(format!(
+                                    "tool_use input_json_delta produced invalid JSON \
+                                     (id={}, name={}): {e}",
+                                    accum.id, accum.name
+                                ));
+                            }
+                        }
+                    }
+                }
                 Ok(AnthropicEvent::MessageStart { message }) => {
                     if let Some(usage) = message.usage {
                         self.input_tokens = usage.input_tokens;
@@ -237,7 +317,7 @@ impl AnthropicDecoder {
                         error.message
                     ));
                 }
-                Ok(_) => {} // ping / content_block_start / content_block_stop
+                Ok(AnthropicEvent::Ping) => {}
                 Err(e) => {
                     self.parse_failures += 1;
                     tracing::warn!(
@@ -311,11 +391,22 @@ enum AnthropicEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: AnthropicMessage },
     #[serde(rename = "content_block_start")]
-    ContentBlockStart,
+    ContentBlockStart {
+        #[serde(default)]
+        index: u32,
+        content_block: AnthropicContentBlock,
+    },
     #[serde(rename = "content_block_delta")]
-    ContentBlockDelta { delta: AnthropicDelta },
+    ContentBlockDelta {
+        #[serde(default)]
+        index: u32,
+        delta: AnthropicDelta,
+    },
     #[serde(rename = "content_block_stop")]
-    ContentBlockStop,
+    ContentBlockStop {
+        #[serde(default)]
+        index: u32,
+    },
     #[serde(rename = "message_delta")]
     MessageDelta {
         #[serde(default)]
@@ -329,11 +420,38 @@ enum AnthropicEvent {
     Error { error: AnthropicErrorBody },
 }
 
+/// The `content_block` payload inside a `content_block_start`. We only
+/// care about `tool_use` here; text blocks don't need any per-block state
+/// because their deltas carry the text directly. `Other` swallows any
+/// future block type (image, search_result, …) so a protocol bump doesn't
+/// break parsing.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum AnthropicContentBlock {
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        name: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum AnthropicDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
+    /// Streamed JSON fragment for a `tool_use` content block. Each fragment
+    /// is appended verbatim to the per-index buffer; the concatenation is
+    /// parsed as JSON at `content_block_stop` time.
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta {
+        #[serde(default)]
+        partial_json: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -528,6 +646,113 @@ mod tests {
     /// arbitrary-sized chunks and assert that `feed` + `eof` + `next_event`
     /// always return cleanly.
     ///
+    /// Streaming tool_use: `content_block_start` carries the id+name,
+    /// `input_json_delta` fragments are concatenated, and a single
+    /// `ChatEvent::ToolUse` with the parsed input is emitted at
+    /// `content_block_stop`. Replays the same fixture across chunk sizes
+    /// 1..=64 to catch fragment-boundary bugs in the accumulator.
+    #[test]
+    fn anthropic_decoder_assembles_streaming_tool_use_call() {
+        let fixture: &[u8] = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":\
+                {\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":\
+                {\"type\":\"text_delta\",\"text\":\"Looking up... \"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":\
+                {\"type\":\"tool_use\",\"id\":\"toolu_abc\",\"name\":\"get_weather\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":\
+                {\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"location\\\":\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":\
+                {\"type\":\"input_json_delta\",\"partial_json\":\" \\\"SF\\\",\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":\
+                {\"type\":\"input_json_delta\",\"partial_json\":\" \\\"unit\\\": \\\"C\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":42}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        )
+        .as_bytes();
+
+        for chunk_size in [1usize, 7, 16, 64] {
+            let mut d = AnthropicDecoder::new(None);
+            let mut i = 0;
+            while i < fixture.len() {
+                let end = (i + chunk_size).min(fixture.len());
+                d.feed(&fixture[i..end]);
+                i = end;
+            }
+            let events: Vec<ChatEvent> =
+                collect(&mut d).into_iter().filter_map(Result::ok).collect();
+
+            // We should see the text delta, then exactly one ToolUse with
+            // the assembled input.
+            let deltas: Vec<&str> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ChatEvent::Delta(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(deltas.join(""), "Looking up... ", "chunk_size={chunk_size}");
+
+            let tool_calls: Vec<(&str, &str, &serde_json::Value)> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ChatEvent::ToolUse { id, name, input } => {
+                        Some((id.as_str(), name.as_str(), input))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(tool_calls.len(), 1, "chunk_size={chunk_size}");
+            let (id, name, input) = tool_calls[0];
+            assert_eq!(id, "toolu_abc");
+            assert_eq!(name, "get_weather");
+            assert_eq!(
+                input,
+                &serde_json::json!({"location": "SF", "unit": "C"}),
+                "chunk_size={chunk_size}"
+            );
+        }
+    }
+
+    /// A tool_use call with no fields (empty `partial_json` stream)
+    /// must still emit a `ChatEvent::ToolUse` with `input = {}` — that's
+    /// a valid call shape, not an error.
+    #[test]
+    fn anthropic_decoder_tool_use_with_empty_input() {
+        let mut d = AnthropicDecoder::new(None);
+        d.feed(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_empty\",\"name\":\"ping\",\"input\":{}}}\n\n");
+        d.feed(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+        let events: Vec<ChatEvent> = collect(&mut d).into_iter().filter_map(Result::ok).collect();
+        match events.first() {
+            Some(ChatEvent::ToolUse { id, name, input }) => {
+                assert_eq!(id, "toolu_empty");
+                assert_eq!(name, "ping");
+                assert_eq!(input, &serde_json::json!({}));
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    /// Malformed `partial_json` fragments must surface as a typed
+    /// `ProviderStream` error, not be silently dropped.
+    #[test]
+    fn anthropic_decoder_tool_use_with_malformed_json_surfaces_error() {
+        let mut d = AnthropicDecoder::new(Some("req-bad-tool".into()));
+        d.feed(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_x\",\"name\":\"f\",\"input\":{}}}\n\n");
+        d.feed(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{not-json\"}}\n\n");
+        d.feed(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+        let err = collect(&mut d)
+            .into_iter()
+            .find_map(|e| e.err())
+            .expect("expected error from malformed tool_use input");
+        let s = err.to_string();
+        assert!(s.contains("tool_use"), "{s}");
+        assert!(s.contains("req-bad-tool"), "{s}");
+    }
+
     /// Fixture-driven invariance check: replay a captured Anthropic SSE
     /// stream at every chunk size from 1 to 128 bytes; the emitted event
     /// stream must be identical across all chunkings. Catches subtle

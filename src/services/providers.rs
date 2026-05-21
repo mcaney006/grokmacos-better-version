@@ -28,6 +28,15 @@ pub struct ChatRequest {
 pub enum ChatEvent {
     /// A delta of generated text. Concatenate to form the full response.
     Delta(String),
+    /// A tool-use call from the assistant. The `input` is the fully
+    /// assembled JSON object parsed from the streamed `input_json_delta`
+    /// fragments (Anthropic) or the equivalent on other providers. Emitted
+    /// once per content block, at `content_block_stop` time.
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
     /// Server reported token usage. Emitted at most once, typically last.
     Usage { input: u32, output: u32 },
     /// Stream completed cleanly.

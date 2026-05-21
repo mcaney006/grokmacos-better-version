@@ -927,6 +927,16 @@ async fn run_completion(
             Ok(ChatEvent::Delta(delta)) => {
                 let _ = tx.send(StreamMsg::Delta(assistant_id, delta));
             }
+            Ok(ChatEvent::ToolUse { id, name, input }) => {
+                // No dedicated tool-call UI yet — inject the call as a
+                // fenced `tool-use` code block so it renders inline in
+                // the markdown view and shows up verbatim in the chat
+                // log. When the proper tool-runner ships, this passes
+                // through a structured StreamMsg::ToolUse instead.
+                tracing::info!(%id, %name, ?input, "anthropic tool_use");
+                let rendered = format!("\n```tool-use\n{name} ({id}): {input}\n```\n");
+                let _ = tx.send(StreamMsg::Delta(assistant_id, rendered));
+            }
             Ok(ChatEvent::Usage { input, output }) => {
                 let _ = tx.send(StreamMsg::Usage(assistant_id, input, output));
             }

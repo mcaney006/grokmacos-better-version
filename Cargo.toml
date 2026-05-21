@@ -44,6 +44,12 @@ hotkeys = ["dep:global-hotkey"]
 # When the plugin host work lands it must pull a current wasmtime (>= 38) and
 # re-enable this dep.
 plugins = []
+# High-quality voice resampling via rubato's sinc-interpolation engine. Off
+# by default (the in-tree LinearResampler is fine for the 24 kHz voice
+# path); flip on with `--features hq-resample` for studio-grade output and
+# accept the extra binary size (~200 KB) + first-batch latency cost of the
+# sinc filter table generation.
+hq-resample = ["dep:rubato"]
 
 [dependencies]
 # --- UI ---
@@ -90,9 +96,12 @@ bincode = { version = "2", features = ["serde"] }
 
 # --- Audio ---
 cpal = "0.17"
-# `rubato` was the original plan for high-quality voice resampling but the
-# in-tree `LinearResampler` in services/audio.rs is good enough for the
-# 24 kHz voice path. Reinstate if/when we need sinc-interpolation quality.
+# Optional high-quality resampler. Gated behind `hq-resample` so the
+# default build stays small (no FFT runtime, no num-complex tree). When
+# enabled, services::audio swaps in a sinc-interpolation engine via
+# rubato::SincFixedIn. The in-tree LinearResampler covers the no-feature
+# build.
+rubato = { version = "0.16", optional = true }
 
 # --- Serialization / models ---
 serde = { version = "1", features = ["derive"] }
