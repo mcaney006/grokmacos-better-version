@@ -160,7 +160,7 @@ fn build_input_stream(
                 } else {
                     mono
                 };
-                let pcm: Vec<i16> = mono.iter().map(|s| f32_to_i16(*s)).collect();
+                let pcm: Vec<i16> = mono.iter().copied().map(f32_to_i16).collect();
                 // `try_send` instead of `send`: if the consumer is behind
                 // we drop the frame rather than block the cpal callback
                 // thread (real-time audio principle: stale audio helps
@@ -173,7 +173,7 @@ fn build_input_stream(
         SampleFormat::I16 => dev.build_input_stream(
             &config,
             move |data: &[i16], _| {
-                let floats: Vec<f32> = data.iter().map(|s| i16_to_f32(*s)).collect();
+                let floats: Vec<f32> = data.iter().copied().map(i16_to_f32).collect();
                 let mono = to_mono_f32(&floats, channels);
                 update_level_f32(&mono, &meter);
                 let mono = if let Some(r) = resampler.as_ref() {
@@ -181,7 +181,7 @@ fn build_input_stream(
                 } else {
                     mono
                 };
-                let pcm: Vec<i16> = mono.iter().map(|s| f32_to_i16(*s)).collect();
+                let pcm: Vec<i16> = mono.iter().copied().map(f32_to_i16).collect();
                 // `try_send` instead of `send`: if the consumer is behind
                 // we drop the frame rather than block the cpal callback
                 // thread (real-time audio principle: stale audio helps
@@ -194,7 +194,7 @@ fn build_input_stream(
         SampleFormat::U16 => dev.build_input_stream(
             &config,
             move |data: &[u16], _| {
-                let floats: Vec<f32> = data.iter().map(|s| Sample::to_sample::<f32>(*s)).collect();
+                let floats: Vec<f32> = data.iter().copied().map(Sample::to_sample::<f32>).collect();
                 let mono = to_mono_f32(&floats, channels);
                 update_level_f32(&mono, &meter);
                 let mono = if let Some(r) = resampler.as_ref() {
@@ -202,7 +202,7 @@ fn build_input_stream(
                 } else {
                     mono
                 };
-                let pcm: Vec<i16> = mono.iter().map(|s| f32_to_i16(*s)).collect();
+                let pcm: Vec<i16> = mono.iter().copied().map(f32_to_i16).collect();
                 // `try_send` instead of `send`: if the consumer is behind
                 // we drop the frame rather than block the cpal callback
                 // thread (real-time audio principle: stale audio helps
@@ -248,13 +248,15 @@ fn build_output_stream(
     };
 
     {
+        // `ring` is also captured by the cpal output closure further
+        // down, so we need a fresh Arc reference for the mixer thread.
+        // `resampler` is NOT used after this block — move it directly.
         let ring = ring.clone();
-        let resampler = resampler.clone();
         std::thread::Builder::new()
             .name("voice-mixer".into())
             .spawn(move || {
                 while let Ok(chunk) = rx.recv() {
-                    let floats: Vec<f32> = chunk.iter().map(|s| i16_to_f32(*s)).collect();
+                    let floats: Vec<f32> = chunk.iter().copied().map(i16_to_f32).collect();
                     let resampled = if let Some(r) = resampler.as_ref() {
                         r.lock().process(&floats)
                     } else {
@@ -306,9 +308,8 @@ fn build_output_stream(
         SampleFormat::U16 => dev.build_output_stream(
             &config,
             {
-                let ring = ring.clone();
-                let meter = meter.clone();
-                let speaking = speaking.clone();
+                // Final arm — outer ring/meter/speaking aren't used past
+                // this point in the function, so move (no Arc bump).
                 move |data: &mut [u16], _| {
                     let frames = data.len() / channels.max(1);
                     let mono = ring.lock().pop(frames);
@@ -342,9 +343,14 @@ fn to_mono_f32(samples: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return samples.to_vec();
     }
+    // `channels` is at most a few (real hardware), so the f32 cast is
+    // exact. The divisor goes through `chunks_exact_div` semantics via
+    // a single per-frame division — no per-sample work.
+    #[allow(clippy::cast_precision_loss)]
+    let inv_channels = 1.0 / channels as f32;
     samples
         .chunks(channels)
-        .map(|frame| frame.iter().copied().sum::<f32>() / channels as f32)
+        .map(|frame| frame.iter().copied().sum::<f32>() * inv_channels)
         .collect()
 }
 
@@ -379,24 +385,41 @@ fn fan_out_i16(out: &mut [i16], mono: &[f32], channels: usize) {
     }
 }
 
+#[inline]
 fn i16_to_f32(s: i16) -> f32 {
-    s as f32 / i16::MAX as f32
+    // `i16 -> f32` is lossless (i16 fits in f32's mantissa), so `From`
+    // is correct AND saves the `as` cast clippy::cast_lossless flags.
+    f32::from(s) / f32::from(i16::MAX)
 }
 
+#[inline]
 fn f32_to_i16(s: f32) -> i16 {
-    (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+    // Clamp to [-1.0, 1.0] before scaling so a stray NaN / out-of-range
+    // sample can't UB-overflow the cast. The clamp also handles +/-Inf.
+    (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
 }
 
 fn update_level_f32(samples: &[f32], meter: &LevelMeter) {
     if samples.is_empty() {
         return;
     }
-    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
-    let rms = (sum_sq / samples.len() as f32).sqrt();
+    // `mul_add(x, y)` is the IEEE fused-multiply-add: one rounding step
+    // instead of two, and a single FMA instruction on modern x86_64 /
+    // aarch64. For an RMS sum this is marginal accuracy + a measurable
+    // throughput win on a hot capture-callback path.
+    let sum_sq: f32 = samples.iter().fold(0.0_f32, |acc, &s| s.mul_add(s, acc));
+    // `samples.len()` can be up to ~24_000 frames per callback; f32's
+    // mantissa is 23 bits so values up to ~16_777_216 round-trip
+    // exactly. We're nowhere near that, and the precision tail doesn't
+    // affect the smoothed UI meter anyway.
+    #[allow(clippy::cast_precision_loss)]
+    let mean_sq = sum_sq / samples.len() as f32;
+    let rms = mean_sq.sqrt();
     let db = 20.0 * (rms.max(1e-6)).log10();
     let norm = ((db + 50.0) / 50.0).clamp(0.0, 1.0);
     let prev = meter.level();
-    meter.set(prev * 0.6 + norm * 0.4);
+    // smoothed = prev * 0.6 + norm * 0.4, expressed as one FMA.
+    meter.set(norm.mul_add(0.4, prev * 0.6));
 }
 
 // --- ring buffer + linear resampler ----------------------------------------
@@ -489,9 +512,22 @@ impl LinearResampler {
             return input.to_vec();
         }
         let ratio = self.src_rate / self.dst_rate;
-        let mut out = Vec::with_capacity((input.len() as f32 / ratio) as usize + 1);
-        while self.pos < input.len() as f32 {
+        // Audio buffers are bounded (<= one cpal callback's worth, typically
+        // 1k-4k samples). `as f32` precision-loss is irrelevant at these
+        // magnitudes; the cast bounds the output capacity hint.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let est_out = (input.len() as f32 / ratio) as usize + 1;
+        let mut out = Vec::with_capacity(est_out);
+        #[allow(clippy::cast_precision_loss)]
+        let input_len_f = input.len() as f32;
+        while self.pos < input_len_f {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let idx = self.pos as usize;
+            #[allow(clippy::cast_precision_loss)]
             let frac = self.pos - idx as f32;
             let a = if idx == 0 {
                 self.last_sample
@@ -499,10 +535,12 @@ impl LinearResampler {
                 input[idx - 1]
             };
             let b = input[idx];
-            out.push(a + (b - a) * frac);
+            // Linear interpolation as a single fused-multiply-add:
+            // out = a + (b - a) * frac  ->  out = (b - a).mul_add(frac, a)
+            out.push((b - a).mul_add(frac, a));
             self.pos += ratio;
         }
-        self.pos -= input.len() as f32;
+        self.pos -= input_len_f;
         if let Some(last) = input.last() {
             self.last_sample = *last;
         }

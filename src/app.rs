@@ -23,6 +23,7 @@ use crate::ui::chat_view::ChatViewState;
 use crate::ui::settings_view::SettingsState;
 use crate::ui::sidebar::{SidebarAction, SidebarState};
 use crate::ui::toast::Toaster;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -192,7 +193,7 @@ impl GrokApp {
             self.toaster.error(format!("could not save message: {e}"));
             return;
         }
-        self.messages.push(user_msg.clone());
+        self.messages.push(user_msg);
 
         if let Some(c) = self.chats.iter_mut().find(|c| c.id == chat_id) {
             if c.title == "New Chat" {
@@ -203,18 +204,15 @@ impl GrokApp {
         }
 
         let s = self.settings.get();
-        let provider = self
-            .chats
-            .iter()
-            .find(|c| c.id == chat_id)
-            .map(|c| c.provider.clone())
-            .unwrap_or_else(|| "xai".to_string());
-        let model = self
-            .chats
-            .iter()
-            .find(|c| c.id == chat_id)
-            .map(|c| c.model.clone())
-            .unwrap_or_else(|| provider_model(&s, s.default_provider).to_string());
+        // Resolve provider + model from the active chat. One `find` pass
+        // instead of two — the previous version walked self.chats twice
+        // and re-cloned independently.
+        let chat = self.chats.iter().find(|c| c.id == chat_id);
+        let provider = chat.map_or_else(|| "xai".to_owned(), |c| c.provider.clone());
+        let model = chat.map_or_else(
+            || provider_model(&s, s.default_provider).to_owned(),
+            |c| c.model.clone(),
+        );
 
         let messages: Vec<WireMessage> = self.messages.iter().map(WireMessage::from).collect();
         // RAG augmentation was previously a synchronous call here on the UI
@@ -224,7 +222,8 @@ impl GrokApp {
         // (via spawn_blocking, since fastembed isn't async-aware).
         let rag_enabled = s.rag_enabled;
         let rag_top_k = s.rag_top_k.max(1) as usize;
-        let rag_query = body.clone();
+        // Last use of `body` — move it into the rag query rather than clone.
+        let rag_query = body;
         let store_for_rag = if rag_enabled {
             Some(self.store.clone())
         } else {
@@ -425,8 +424,12 @@ impl GrokApp {
                         if m.content.is_empty() {
                             m.content = format!("⚠ {err}");
                         } else {
-                            m.content
-                                .push_str(&format!("\n\n⚠ stream ended early: {err}"));
+                            // `write!` against String is infallible; the
+                            // only way `write_str` returns Err for a
+                            // String impl is via allocator failure,
+                            // which would panic regardless. `let _`
+                            // documents the intentional discard.
+                            let _ = write!(m.content, "\n\n⚠ stream ended early: {err}");
                         }
                         let _ = self.store.update_message(m);
                     }
@@ -716,7 +719,8 @@ impl GrokApp {
                 let updated = self.settings.update(|s| s.default_provider = p);
                 let _ = self.store.save_settings(&updated);
                 self.settings_view.api_key_buffer = load_existing_key(p);
-                self.toaster.info(format!("provider: {}", p.label()));
+                self.toaster
+                    .info(format!("provider: {label}", label = p.label()));
             }
             A::SelectChat(id) => {
                 self.active_chat = Some(id);
@@ -821,7 +825,10 @@ impl GrokApp {
             }
         }
         match std::fs::write(&dest, body) {
-            Ok(()) => self.toaster.info(format!("exported to {}", dest.display())),
+            Ok(()) => {
+                let display = dest.display();
+                self.toaster.info(format!("exported to {display}"));
+            }
             Err(e) => self.toaster.error(format!("write: {e}")),
         }
     }
@@ -928,8 +935,8 @@ fn augment_with_rag_blocking(
         return messages;
     }
     let mut context = String::from("Relevant prior context:\n");
-    for h in hits {
-        context.push_str(&format!("- {}\n", h.snippet.replace('\n', " ")));
+    for h in &hits {
+        let _ = writeln!(context, "- {}", h.snippet.replace('\n', " "));
     }
     messages.insert(
         0,

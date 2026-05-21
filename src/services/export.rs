@@ -7,6 +7,7 @@
 
 use crate::models::{Chat, Message, Role};
 use serde::Serialize;
+use std::fmt::Write as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -33,18 +34,24 @@ pub fn export(chat: &Chat, messages: &[Message], format: Format) -> String {
 }
 
 fn markdown(chat: &Chat, messages: &[Message], obsidian: bool) -> String {
-    let mut out = String::new();
+    // `write!` against `String` is infallible — the only way the formatter
+    // can fail is OOM, which would panic the process from any code path
+    // anyway. We discard the Result with `let _ =` so the unused-must-use
+    // lint stays happy without an unwrap. This avoids the intermediate
+    // `format!` allocation the original `out.push_str(&format!(...))`
+    // pattern would have produced on every line.
+    let mut out = String::with_capacity(256 + messages.len() * 128);
     if obsidian {
         out.push_str("---\n");
-        out.push_str(&format!("title: {}\n", yaml_safe(&chat.title)));
-        out.push_str(&format!("created: {}\n", chat.created_at.to_rfc3339()));
-        out.push_str(&format!("updated: {}\n", chat.updated_at.to_rfc3339()));
-        out.push_str(&format!("provider: {}\n", chat.provider));
-        out.push_str(&format!("model: {}\n", chat.model));
+        let _ = writeln!(out, "title: {}", yaml_safe(&chat.title));
+        let _ = writeln!(out, "created: {}", chat.created_at.to_rfc3339());
+        let _ = writeln!(out, "updated: {}", chat.updated_at.to_rfc3339());
+        let _ = writeln!(out, "provider: {}", chat.provider);
+        let _ = writeln!(out, "model: {}", chat.model);
         out.push_str("tags: [grok-insane]\n");
         out.push_str("---\n\n");
     }
-    out.push_str(&format!("# {}\n\n", chat.title));
+    let _ = writeln!(out, "# {}\n", chat.title);
     if let Some(sp) = chat.system_prompt.as_ref() {
         if !sp.trim().is_empty() {
             out.push_str("> **system**\n>\n");
@@ -63,11 +70,11 @@ fn markdown(chat: &Chat, messages: &[Message], obsidian: bool) -> String {
             Role::System => "ℹ️ **System**",
             Role::Tool => "🛠 **Tool**",
         };
-        out.push_str(&format!(
-            "## {} · `{}`\n\n",
-            label,
+        let _ = writeln!(
+            out,
+            "## {label} · `{}`\n",
             m.created_at.format("%Y-%m-%d %H:%M:%S")
-        ));
+        );
         out.push_str(m.content.trim_end());
         out.push_str("\n\n");
     }
@@ -82,7 +89,7 @@ struct JsonChat<'a> {
 
 fn json(chat: &Chat, messages: &[Message]) -> String {
     serde_json::to_string_pretty(&JsonChat { chat, messages })
-        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+        .unwrap_or_else(|e| format!(r#"{{"error": "{e}"}}"#))
 }
 
 fn yaml_safe(s: &str) -> String {
@@ -95,7 +102,7 @@ fn yaml_safe(s: &str) -> String {
         let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
         format!("\"{escaped}\"")
     } else {
-        s.to_string()
+        s.to_owned()
     }
 }
 

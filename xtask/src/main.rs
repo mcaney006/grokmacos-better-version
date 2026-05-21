@@ -178,12 +178,12 @@ where
 }
 
 pub(crate) fn run_cmd(cmd: &mut Command) -> Result<()> {
-    let pretty = format!("{:?}", cmd);
+    let pretty = format!("{cmd:?}");
     let status = cmd
         .status()
         .with_context(|| format!("failed to spawn {pretty}"))?;
     if !status.success() {
-        bail!("command failed ({}): {pretty}", status);
+        bail!("command failed ({status}): {pretty}");
     }
     Ok(())
 }

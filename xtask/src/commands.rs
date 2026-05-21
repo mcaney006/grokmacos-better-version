@@ -81,9 +81,9 @@ pub(crate) fn dist() -> Result<()> {
 
     let hash = sha256_file(&dest).with_context(|| format!("hash {}", dest.display()))?;
     let sums = out_dir.join("SHA256SUMS");
-    std::fs::write(&sums, format!("{hash}  {}\n", bin_name))
+    std::fs::write(&sums, format!("{hash}  {bin_name}\n"))
         .with_context(|| format!("write {}", sums.display()))?;
-    println!("hash: {} -> {}", bin_name, hash);
+    println!("hash: {bin_name} -> {hash}");
 
     Ok(())
 }

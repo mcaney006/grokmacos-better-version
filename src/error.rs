@@ -112,10 +112,10 @@ impl ApiError {
 
     /// Build the rendered `retry_hint` string for the `RateLimited` display.
     pub fn fmt_retry_hint(retry_after: Option<std::time::Duration>) -> String {
-        match retry_after {
-            Some(d) => format!(" (retry after {}s)", d.as_secs()),
-            None => String::new(),
-        }
+        retry_after.map_or_else(String::new, |d| {
+            let secs = d.as_secs();
+            format!(" (retry after {secs}s)")
+        })
     }
 
     /// Render an `Option<String>` request-id into the bracketed form

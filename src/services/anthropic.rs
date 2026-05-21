@@ -53,7 +53,10 @@ impl ChatProvider for AnthropicClient {
         for m in req.messages {
             if m.role == "system" {
                 system = Some(match system {
-                    Some(prev) if !prev.is_empty() => format!("{prev}\n\n{}", m.content),
+                    Some(prev) if !prev.is_empty() => {
+                        let content = m.content;
+                        format!("{prev}\n\n{content}")
+                    }
                     _ => m.content,
                 });
             } else {

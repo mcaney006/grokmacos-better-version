@@ -307,9 +307,12 @@ impl VoiceSession {
         });
 
         // Downlink: decode JSON frames + ferry events to UI / audio.
+        // `events_tx` and `last_recv` have already been cloned for the
+        // uplink + watchdog tasks above — this is their last use here,
+        // so move into the downlink task rather than refcount-bump.
         let playback_tx = shared.playback_tx.clone();
-        let downlink_events = events_tx.clone();
-        let downlink_recv = last_recv.clone();
+        let downlink_events = events_tx;
+        let downlink_recv = last_recv;
         tokio::spawn(async move {
             let _ = downlink_events.send(VoiceEvent::Connected);
             loop {

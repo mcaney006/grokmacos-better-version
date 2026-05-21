@@ -297,8 +297,7 @@ pub(crate) async fn send_with_rate_limit_retry<B: serde::Serialize>(
             Ok(Err(e)) => return Err(ApiError::Http(e)),
             Err(_elapsed) => {
                 return Err(ApiError::InvalidResponse(format!(
-                    "request timed out before response headers ({}s)",
-                    PRE_FIRST_BYTE_TIMEOUT_SECS
+                    "request timed out before response headers ({PRE_FIRST_BYTE_TIMEOUT_SECS}s)"
                 )));
             }
         };

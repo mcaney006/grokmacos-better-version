@@ -48,7 +48,7 @@ impl SearchIndex {
         let schema = builder.build();
 
         let dir = tantivy::directory::MmapDirectory::open(dir)?;
-        let index = Index::open_or_create(dir, schema.clone())?;
+        let index = Index::open_or_create(dir, schema)?;
         let writer: IndexWriter = index.writer(WRITER_HEAP)?;
         let reader = index
             .reader_builder()
