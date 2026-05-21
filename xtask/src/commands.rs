@@ -127,6 +127,9 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String> {
 pub(crate) fn audit() -> Result<()> {
     ensure_installed("cargo-audit")?;
     ensure_installed("cargo-deny")?;
+    // Keep this ignore list in sync with `deny.toml` [advisories.ignore].
+    // Drop entries here when the affected version leaves the transitive
+    // graph; cargo-deny warns on unused ignores so they're easy to spot.
     cargo([
         "audit",
         "--deny",
@@ -136,13 +139,7 @@ pub(crate) fn audit() -> Result<()> {
         "--ignore",
         "RUSTSEC-2024-0320",
         "--ignore",
-        "RUSTSEC-2026-0002",
-        "--ignore",
         "RUSTSEC-2025-0141",
-        "--ignore",
-        "RUSTSEC-2025-0119",
-        "--ignore",
-        "RUSTSEC-2024-0436",
     ])?;
     cargo(["deny", "check", "advisories", "bans", "sources", "licenses"])?;
     Ok(())

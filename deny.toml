@@ -24,21 +24,14 @@ ignore = [
     # untrusted YAML — input is the embedded grammar files compiled into
     # the binary.
     "RUSTSEC-2024-0320",
-    # `lru` IterMut unsound (RUSTSEC-2026-0002). Comes via `tantivy`; the
-    # affected iterator is not exposed across our API boundary. Will be
-    # fixed by bumping tantivy when 0.26+ becomes compatible with our
-    # other deps.
-    "RUSTSEC-2026-0002",
     # `bincode` 1.x unmaintained — we've already migrated to 2.x. Some
     # build-only transitives still pull 1.x; harmless.
     "RUSTSEC-2025-0141",
-    # `number_prefix` unmaintained — used only transitively by indicatif
-    # for human-readable byte counts in download progress bars (fastembed
-    # only, behind the `rag` feature). No security surface.
-    "RUSTSEC-2025-0119",
-    # `paste` unmaintained — used at compile time only by various proc-
-    # macros (tantivy, eframe). Build-time, no runtime exposure.
-    "RUSTSEC-2024-0436",
+    # Three previously-ignored advisories (RUSTSEC-2024-0436 paste,
+    # RUSTSEC-2025-0119 number_prefix, RUSTSEC-2026-0002 lru) were dropped
+    # from this list after a cargo update removed the affected versions
+    # from our transitive graph. If they come back, they'll fail audit
+    # loud — which is what we want.
 ]
 
 [licenses]
@@ -84,13 +77,14 @@ deny = [
     { name = "openssl-sys", reason = "rustls is the policy; bringing in OpenSSL is unsafe surface area" },
     { name = "native-tls", reason = "rustls is the policy" },
 ]
-# Permit known multi-version duplicates that come from the egui ecosystem.
+# Permit known multi-version duplicates that come from the egui /
+# rand / windows-sys ecosystems. Each entry MUST correspond to a real
+# duplicate in the current Cargo.lock — `cargo deny check` warns on
+# unused skips, which is a good prompt to keep this list honest.
 skip = [
     { name = "bitflags" },
-    { name = "syn" },
     { name = "windows-sys" },
     { name = "windows-targets" },
-    { name = "wasi" },
     { name = "rand" },
     { name = "rand_chacha" },
     { name = "rand_core" },
@@ -98,8 +92,10 @@ skip = [
     { name = "hashbrown" },
     { name = "thiserror" },
     { name = "thiserror-impl" },
-    { name = "regex-automata" },
-    { name = "regex-syntax" },
+    # Previously-skipped (now single-version, dropped from the list to
+    # silence the unnecessary-skip warning): syn, wasi, regex-automata,
+    # regex-syntax. If a dep brings in a duplicate again later, deny
+    # will fail loud — which is what we want.
 ]
 
 [sources]
