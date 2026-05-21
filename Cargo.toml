@@ -6,8 +6,15 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.78"
+# MSRV matches `rust-toolchain.toml` exactly. The previous value (1.78)
+# was aspirational — several transitive deps (sysinfo, ort-sys behind
+# `rag`) require >= 1.88, and `rust-toolchain.toml` pins 1.94. Claiming
+# a lower MSRV here when no CI runs on it would be marketing fraud.
+# When bumping the toolchain, bump this in lockstep.
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/mcaney006/grokmacos-better-version"
+homepage = "https://github.com/mcaney006/grokmacos-better-version"
 
 [package]
 name = "grok-insane"
@@ -15,7 +22,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Cross-platform high-performance desktop client for xAI Grok with voice, search, and multi-provider support."
+repository.workspace = true
+homepage.workspace = true
+description = "Cross-platform desktop client for xAI Grok and OpenAI-compatible providers, with voice mode, local-first storage, and full-text search."
+documentation = "https://github.com/mcaney006/grokmacos-better-version#readme"
+readme = "README.md"
+keywords = ["xai", "grok", "llm", "chat", "egui"]
+categories = ["gui", "command-line-utilities"]
 publish = false
 
 [lib]

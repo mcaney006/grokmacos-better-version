@@ -35,3 +35,9 @@ dist/
 # AI agent files
 .agent/
 .claude/cache/
+
+# Build artefacts produced by `cargo xtask dist|bundle|release`
+/dist/
+/xtask/dist/
+
+# Local development scratch

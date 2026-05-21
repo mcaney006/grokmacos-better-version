@@ -1,16 +1,26 @@
 # GrokInsane
 
 [![CI](https://github.com/mcaney006/grokmacos-better-version/actions/workflows/ci.yml/badge.svg)](https://github.com/mcaney006/grokmacos-better-version/actions/workflows/ci.yml)
-[![Rust](https://img.shields.io/badge/rust-1.78%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Audit](https://github.com/mcaney006/grokmacos-better-version/actions/workflows/audit.yml/badge.svg)](https://github.com/mcaney006/grokmacos-better-version/actions/workflows/audit.yml)
+[![Rust](https://img.shields.io/badge/rust-1.94-orange?logo=rust)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](#license)
 
-A cross-platform desktop client for xAI Grok, OpenAI, Anthropic, and any local
-OpenAI-compatible model. Rewritten from the original SwiftUI macOS app into
-pure Rust + egui — a single binary that runs on **macOS, Windows, and Linux**
+> **Status: pre-1.0 (v0.1.x).** Streaming chat, local-first storage,
+> full-text search, and voice mode all work today. The release pipeline
+> (Sigstore + SLSA + macOS notarization) is wired but has not yet been
+> integration-tested against a real `v0.1.0` tag. See
+> [`CHANGELOG.md`](CHANGELOG.md) for what's actually shipped.
+
+A cross-platform desktop client for xAI Grok, OpenAI, Anthropic, and any
+OpenAI-compatible local model. Rewritten from the original SwiftUI macOS app
+into Rust + `egui` — a single binary that runs on **macOS, Windows, and Linux**
 with the same code.
 
-> No Xcode. No shell scripts. No Electron. One `cargo` build. ~80 MB RAM in
-> normal use, sub-100 ms startup, GPU-accelerated UI via wgpu.
+No Xcode, no shell scripts, no Electron, no embedded browser. One `cargo`
+build, native rendering via `wgpu`. The cold-start CLI invocation
+(`grok-insane --version`) measures ~4 ms on the maintainer's machine; the
+GUI cold start is unmeasured but architecturally bounded by tokio runtime
+init + first wgpu frame.
 
 ---
 
@@ -484,20 +494,46 @@ watch live numbers.
 
 ## Testing
 
-```
-cargo xtask test       # the full suite, in workspace
-cargo test --bin grok-insane storage::   # one module
+```bash
+cargo xtask check                  # fmt + clippy + tests
+cargo nextest run --workspace      # parallel test runner
+cargo test --workspace             # if you don't have nextest installed
 ```
 
-Current coverage (10 unit tests, all green):
+105 tests passing across the workspace (default + `--no-default-features`
++ `--features hq-resample` configurations). Coverage spans:
 
-- `storage::tests::settings_roundtrip` — bincode round-trip through redb.
-- `storage::tests::chat_and_messages_persist_and_order` — composite-key
-  ordering by created_at.
-- `storage::tests::delete_chat_removes_messages` — range delete cleanup.
-- `storage::tests::delete_message_drops_it_from_history_and_index` —
-  redb + tantivy stay in sync.
-- `storage::tests::full_text_search_finds_keyword` — tantivy round-trip.
+- **Streaming decoders** — both providers (xAI/OpenAI-compatible + Anthropic)
+  have property tests (`proptest`, 256 cases × 4 KiB inputs, with
+  counterexamples persisted to `proptest-regressions/`) AND an in-tree
+  1000-seed LCG fuzz. Adversarial regression tests cover post-`[DONE]`
+  silence, oversize lines, mid-feed terminators, zero-byte chunks, malformed
+  JSON, provider error events, and EOF-before-terminator.
+- **Tool-use streaming** — `input_json_delta` accumulator tested for
+  multi-fragment assembly across chunk sizes 1/7/16/64, empty-input calls,
+  malformed-JSON error surfacing, and fence-injection sanitisation.
+- **WebSocket health** — connect-timeout against a hung handshake,
+  keepalive-failure surfaces an Error event, receive-watchdog deadline.
+- **Storage** — chat/message round-trip, range-scan ordering,
+  delete-chat / delete-message cleanup across redb + tantivy, settings
+  decode-failure fallback, individually-corrupt entry skip, and the new
+  startup reconciliation when redb and tantivy diverge.
+- **Cancellation** — `consume_chat_stream` honours cancel-before-loop and
+  cancel-mid-stream, surfaces provider errors without trailing Done, and
+  synthesises a Done on silent EOF.
+- **Rate-limit retry** — mock HTTP server confirms `Retry-After` is
+  honoured, retry budget is bounded, and non-429 errors short-circuit.
+- **Audio + resampler** — identity rate, ~0.5 downsample ratio, empty
+  input, queue overflow drops cleanly without panic.
+
+See [`TESTING.md`](TESTING.md) for the full inventory and the
+[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the security risk →
+control mapping.
+
+A `cargo-fuzz` workspace lives in [`fuzz/`](fuzz/) with libFuzzer
+harnesses for both SSE decoders, seeded from in-tree golden fixtures.
+Run on-demand with `cargo +nightly fuzz run sse_decoder -- -max_total_time=60`.
+Not run continuously by CI today.
 - `services::chat::tests::sse_decoder_extracts_deltas_and_done` — OpenAI-
   compatible SSE state machine.
 - `services::anthropic::tests::anthropic_decoder_parses_text_delta_and_stop`
@@ -510,18 +546,36 @@ Current coverage (10 unit tests, all green):
 
 ## Roadmap
 
-Already shipped this iteration is in [Features](#features). Next planned:
+Already shipped this iteration: see [`CHANGELOG.md`](CHANGELOG.md).
 
-- [ ] **Streaming TTS playback** — play audio chunks as they arrive instead of
-      waiting on `audio.done`.
-- [ ] **Interruptible TTS** — barge-in via a key while speaking.
-- [ ] **Image input** for vision-capable models (xAI, OpenAI, Anthropic).
-- [ ] **File / tool attachments** in the composer.
-- [ ] **Plugin manifest** + a couple of reference WASM plugins behind the
-      `plugins` feature.
-- [ ] **`cargo xtask bundle` improvements** — codesign + notarise on macOS,
-      MSIX on Windows, AppImage on Linux.
-- [ ] **`cargo dist`** integration once we want signed GitHub Releases.
+### Not yet implemented (treat these as experimental until they ship)
+
+- **Streaming TTS playback** — play audio chunks as they arrive instead
+  of waiting on `audio.done`. The WebSocket plumbing exists; the audio
+  sink hookup does not.
+- **Interruptible TTS** — barge-in via a key while speaking.
+- **Image input** for vision-capable models. Provider clients don't yet
+  serialise image content blocks.
+- **File / tool attachments** in the composer. The Anthropic decoder
+  surfaces tool_use events end-to-end; there is NO local tool runner.
+  The `plugins` feature gate is reserved but contains no implementation
+  — `wasmtime` was intentionally NOT pulled in because of outstanding
+  RUSTSEC advisories at the time of writing. Will reinstate when
+  `wasmtime >= 38` is compatible with our other deps.
+- **Continuous fuzzing in CI** — `fuzz/` harnesses run on-demand;
+  scheduling them weekly requires a nightly job, deferred.
+- **Apple Developer ID signing** in CI — workflow exists, secrets aren't
+  configured. First DMG will be ad-hoc signed; macOS users will see a
+  Gatekeeper prompt until real Developer ID credentials land.
+
+### Shipped (was on the original roadmap, completed)
+
+- ✅ **macOS notarization** — implemented in `xtask::mac::{sign, notarize, dmg}`,
+  exercised by the release workflow.
+- ✅ **Sigstore keyless signing** — every release artifact gets a cosign
+  bundle via the release workflow.
+- ✅ **SLSA build provenance** — via `actions/attest-build-provenance`.
+- ✅ **CycloneDX SBOM** — generated per release via `cargo-cyclonedx`.
 
 ---
 

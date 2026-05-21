@@ -1,6 +1,18 @@
 # Testing Strategy & Coverage
 
-This document tracks the test suite expansion from the audit baseline (10 tests → 60+ tests) and maps each new test to the high-risk scenarios identified in the security review.
+This document captures the testing posture across the workspace.
+The canonical count is whatever `cargo nextest run --workspace`
+reports right now — currently **105 tests**. Don't trust any
+hard-coded number in this doc; trust the runner.
+
+```bash
+cargo nextest run --workspace                            # default features
+cargo nextest run --workspace --features hq-resample     # SincFixedIn resampler
+cargo nextest run --workspace --features hotkeys         # global-hotkey wired
+cargo nextest run --workspace --no-default-features      # core only
+```
+
+All four configurations are gated by CI (`.github/workflows/ci.yml`).
 
 ## Audit Findings → Test Coverage
 
