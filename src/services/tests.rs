@@ -67,10 +67,13 @@ mod streaming_resilience {
 
     #[test]
     fn sse_decoder_rejects_oversize_line() {
-        // LINE_BUDGET_BYTES = 1024*1024 in the actual code.
-        // Send 1MB + 1 byte; buffer.extend should return Overflow.
+        // Use the actual constant rather than hard-coding a magic number —
+        // the original test hard-coded 1 MiB while the real constant is
+        // 4 MiB (see `services::sse::LINE_BUDGET_BYTES`), so the test
+        // silently passed locally but would fail any time the constant
+        // moved. Bind to the real value to make this a real invariant.
         let mut buf = LineByteBuffer::default();
-        let oversized = vec![b'x'; 1024 * 1024 + 1];
+        let oversized = vec![b'x'; crate::services::sse::LINE_BUDGET_BYTES + 1];
         let status = buf.extend(&oversized);
         // After overflow, buffer is cleared to prevent OOM.
         match status {
@@ -100,13 +103,14 @@ mod keyring_resilience {
     }
 
     #[derive(Clone)]
+    #[allow(dead_code)] // `Success` is exercised below via roundtrip tests; remaining variants document the failure surface.
     enum KeyringBehavior {
         Success,
-        MissingBackend,     // Linux: no Secret Service
-        Locked,             // macOS: Keychain locked
-        Denied,             // Permission denied
-        CorruptedEntry,     // Unreadable value
-        Timeout,            // Operation times out
+        MissingBackend, // Linux: no Secret Service
+        Locked,         // macOS: Keychain locked
+        Denied,         // Permission denied
+        CorruptedEntry, // Unreadable value
+        Timeout,        // Operation times out
     }
 
     impl MockKeyring {
@@ -123,6 +127,7 @@ mod keyring_resilience {
             }
         }
 
+        #[allow(dead_code)] // documented surface for future write-failure tests
         fn set(&self, _key: &str, _value: &str) -> Result<(), String> {
             match self.behavior {
                 KeyringBehavior::Success => Ok(()),
@@ -215,12 +220,12 @@ mod keyring_resilience {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod storage_consistency {
-    use std::sync::Arc;
     use parking_lot::Mutex;
+    use std::sync::Arc;
 
     /// Minimal mock to track whether redb and tantivy writes succeed/fail.
     struct StorageOperationTracker {
-        redb_writes: Arc<Mutex<Vec<bool>>>,   // true = success
+        redb_writes: Arc<Mutex<Vec<bool>>>,    // true = success
         tantivy_writes: Arc<Mutex<Vec<bool>>>, // true = success
     }
 
@@ -243,8 +248,7 @@ mod storage_consistency {
         fn is_consistent(&self) -> bool {
             let redb = self.redb_writes.lock();
             let tantivy = self.tantivy_writes.lock();
-            redb.len() == tantivy.len()
-                && redb.iter().zip(tantivy.iter()).all(|(&a, &b)| a == b)
+            redb.len() == tantivy.len() && redb.iter().zip(tantivy.iter()).all(|(&a, &b)| a == b)
         }
 
         fn drift_detected(&self) -> bool {
@@ -306,7 +310,7 @@ mod cancellation_and_shutdown {
         let handle = tokio::spawn(async move {
             // Fake streaming task.
             for i in 0..1000 {
-                let _ = tx.send(format!("chunk {}", i)).await;
+                let _ = tx.send(format!("chunk {i}")).await;
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         });
@@ -319,11 +323,7 @@ mod cancellation_and_shutdown {
         handle.abort();
 
         // Spawn a wait-for-abort and assert it completes quickly.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            async { handle.await },
-        )
-        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
 
         match result {
             Ok(Err(tokio::task::JoinError { .. })) => {
@@ -345,7 +345,7 @@ mod cancellation_and_shutdown {
         let send_handle = tokio::spawn(async move {
             // Try to send 1000 items. If rx drops, send calls should fail gracefully.
             for i in 0..1000 {
-                match tx.send(format!("item {}", i)).await {
+                match tx.send(format!("item {i}")).await {
                     Ok(()) => {}
                     Err(_e) => {
                         // Expected: receiver dropped, channel closed.
@@ -364,11 +364,7 @@ mod cancellation_and_shutdown {
         drop(rx);
 
         // Send task should detect closed channel and exit cleanly.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            send_handle,
-        )
-        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), send_handle).await;
 
         assert!(result.is_ok());
     }
@@ -395,11 +391,7 @@ mod cancellation_and_shutdown {
         let _ = shutdown_tx.send(()).await;
 
         // Background task should exit quickly.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            bg_handle,
-        )
-        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), bg_handle).await;
 
         assert!(result.is_ok());
     }
@@ -507,8 +499,8 @@ mod feature_flag_compile_checks {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod concurrent_writes {
-    use std::sync::Arc;
     use parking_lot::Mutex;
+    use std::sync::Arc;
 
     #[test]
     fn concurrent_chat_writes_do_not_corrupt_storage() {

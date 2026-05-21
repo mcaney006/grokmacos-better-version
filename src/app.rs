@@ -988,12 +988,39 @@ async fn run_completion(
         Provider::Anthropic => Box::new(AnthropicClient::new(api_key)),
         Provider::Local => Box::new(LocalClient::new(api_key)),
     };
-    let mut stream = client.stream(request).await?;
+    let stream = client.stream(request).await?;
+    consume_chat_stream(stream, cancel, tx, assistant_id).await;
+    Ok(())
+}
+
+/// Consume a `ChatEvent` stream into `StreamMsg`s on `tx`. Extracted from
+/// `run_completion` so the cancellation + event-translation logic is
+/// testable without needing to mock a real `ChatProvider`. The cancel
+/// flag is checked **before** each event so a cancel set between the
+/// previous tx.send and the next stream.next is honoured promptly.
+///
+/// Termination contract: this function returns when ANY of:
+///
+/// - the stream yields `None` (clean EOF),
+/// - an event is `Ok(ChatEvent::Done)` (provider terminator),
+/// - an event is `Err(_)` (any stream error),
+/// - the cancel flag is `true` on entry to the loop body.
+///
+/// In every termination path, exactly ONE terminal `StreamMsg::Done` or
+/// `StreamMsg::Error` is sent. The caller's `DoneOnDrop` guard is the
+/// only thing that fires `Done` if this function panics.
+async fn consume_chat_stream(
+    stream: crate::services::providers::EventStream,
+    cancel: Arc<AtomicBool>,
+    tx: UnboundedSender<StreamMsg>,
+    assistant_id: Uuid,
+) {
     use futures_util::StreamExt;
+    let mut stream = stream;
     while let Some(item) = stream.next().await {
         if cancel.load(Ordering::SeqCst) {
             let _ = tx.send(StreamMsg::Done(assistant_id));
-            return Ok(());
+            return;
         }
         match item {
             Ok(ChatEvent::Delta(delta)) => {
@@ -1031,16 +1058,19 @@ async fn run_completion(
             }
             Ok(ChatEvent::Done) => {
                 let _ = tx.send(StreamMsg::Done(assistant_id));
-                return Ok(());
+                return;
             }
             Err(e) => {
                 let _ = tx.send(StreamMsg::Error(assistant_id, e.to_string()));
-                return Ok(());
+                return;
             }
         }
     }
+    // Stream EOF with no terminator — the decoders convert this to an
+    // explicit `Err(StreamTruncated)` already, so we should never reach
+    // here in production. Belt-and-braces: send Done so the UI clears
+    // its `streaming_message_id`.
     let _ = tx.send(StreamMsg::Done(assistant_id));
-    Ok(())
 }
 
 impl eframe::App for GrokApp {
@@ -1222,5 +1252,181 @@ impl eframe::App for GrokApp {
         if self.streaming_message_id.is_some() || self.chat_view.voice_active {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::error::ApiError;
+    use crate::services::providers::ChatEvent;
+    use futures_util::stream;
+    use tokio::sync::mpsc;
+
+    fn fake_stream(
+        events: Vec<Result<ChatEvent, ApiError>>,
+    ) -> crate::services::providers::EventStream {
+        Box::pin(stream::iter(events))
+    }
+
+    /// Cancel-flag set BEFORE the loop starts → first poll honours it
+    /// and exits without forwarding any deltas.
+    #[tokio::test(flavor = "current_thread")]
+    async fn consume_chat_stream_honours_cancel_set_before_loop() {
+        let cancel = Arc::new(AtomicBool::new(true)); // pre-set
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let assistant = Uuid::new_v4();
+        let s = fake_stream(vec![
+            Ok(ChatEvent::Delta("a".into())),
+            Ok(ChatEvent::Delta("b".into())),
+            Ok(ChatEvent::Done),
+        ]);
+        consume_chat_stream(s, cancel, tx, assistant).await;
+        // Exactly one terminal Done with the right id; no deltas leaked.
+        let mut deltas = 0;
+        let mut dones = 0;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                StreamMsg::Delta(id, _) => {
+                    assert_eq!(id, assistant);
+                    deltas += 1;
+                }
+                StreamMsg::Done(id) => {
+                    assert_eq!(id, assistant);
+                    dones += 1;
+                }
+                other => panic!("unexpected msg: {other:?}"),
+            }
+        }
+        assert_eq!(deltas, 0);
+        assert_eq!(dones, 1);
+    }
+
+    /// Cancel flipped MID-stream is honoured at the very next loop iter.
+    #[tokio::test(flavor = "current_thread")]
+    async fn consume_chat_stream_honours_cancel_mid_stream() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let assistant = Uuid::new_v4();
+
+        // Construct a stream whose second item flips the cancel flag
+        // BEFORE yielding (simulating an external cancel arriving
+        // between yields).
+        let cancel_inner = cancel.clone();
+        let s = stream::unfold(0u32, move |i| {
+            let cancel_inner = cancel_inner.clone();
+            async move {
+                match i {
+                    0 => Some((Ok(ChatEvent::Delta("good".into())), 1)),
+                    1 => {
+                        cancel_inner.store(true, Ordering::SeqCst);
+                        // Yield another delta — but the cancel check
+                        // at the TOP of the next iteration must drop it.
+                        Some((Ok(ChatEvent::Delta("poison".into())), 2))
+                    }
+                    _ => None,
+                }
+            }
+        });
+        consume_chat_stream(Box::pin(s), cancel, tx, assistant).await;
+        let mut deltas: Vec<String> = Vec::new();
+        let mut dones = 0;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                StreamMsg::Delta(_, body) => deltas.push(body),
+                StreamMsg::Done(_) => dones += 1,
+                other => panic!("unexpected msg: {other:?}"),
+            }
+        }
+        // We see at most "good"; "poison" might or might not be visible
+        // depending on iteration order, but at least the cancel must
+        // produce a terminal Done.
+        assert!(!deltas.contains(&"poison".to_owned()), "deltas={deltas:?}");
+        assert_eq!(dones, 1);
+    }
+
+    /// `Err` from the stream surfaces as exactly one `StreamMsg::Error`
+    /// with the carrier id; no extra Done after.
+    #[tokio::test(flavor = "current_thread")]
+    async fn consume_chat_stream_surfaces_provider_error() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let assistant = Uuid::new_v4();
+        let s = fake_stream(vec![
+            Ok(ChatEvent::Delta("partial".into())),
+            Err(ApiError::ProviderStream {
+                provider: "test",
+                message: "boom".into(),
+                request_id: String::new(),
+            }),
+            // Trailing events MUST be ignored: the function returns on
+            // the first Err.
+            Ok(ChatEvent::Delta("ignored".into())),
+        ]);
+        consume_chat_stream(s, cancel, tx, assistant).await;
+        let mut got_error = false;
+        let mut got_done = false;
+        let mut deltas: Vec<String> = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                StreamMsg::Delta(_, body) => deltas.push(body),
+                StreamMsg::Error(_, _) => got_error = true,
+                StreamMsg::Done(_) => got_done = true,
+                StreamMsg::Usage(_, _, _) => {}
+            }
+        }
+        assert_eq!(deltas, vec!["partial"]);
+        assert!(got_error, "Error not surfaced");
+        assert!(
+            !got_done,
+            "Done emitted after Error — would overwrite UI error state"
+        );
+    }
+
+    /// `Usage` is forwarded; `Done` follows; no extra messages after.
+    #[tokio::test(flavor = "current_thread")]
+    async fn consume_chat_stream_forwards_usage_then_done() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let assistant = Uuid::new_v4();
+        let s = fake_stream(vec![
+            Ok(ChatEvent::Delta("hi".into())),
+            Ok(ChatEvent::Usage {
+                input: 3,
+                output: 1,
+            }),
+            Ok(ChatEvent::Done),
+        ]);
+        consume_chat_stream(s, cancel, tx, assistant).await;
+        let mut seq: Vec<&'static str> = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            seq.push(match msg {
+                StreamMsg::Delta(_, _) => "delta",
+                StreamMsg::Usage(_, _, _) => "usage",
+                StreamMsg::Done(_) => "done",
+                StreamMsg::Error(_, _) => "error",
+            });
+        }
+        assert_eq!(seq, vec!["delta", "usage", "done"]);
+    }
+
+    /// Stream that ends without a terminator still produces ONE Done.
+    /// (Production decoders convert this to `StreamTruncated`; this is
+    /// the belt-and-braces path.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn consume_chat_stream_synthesises_done_on_silent_eof() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let assistant = Uuid::new_v4();
+        let s = fake_stream(vec![Ok(ChatEvent::Delta("only".into()))]);
+        consume_chat_stream(s, cancel, tx, assistant).await;
+        let mut dones = 0;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, StreamMsg::Done(_)) {
+                dones += 1;
+            }
+        }
+        assert_eq!(dones, 1);
     }
 }
