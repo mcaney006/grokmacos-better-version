@@ -276,6 +276,34 @@ impl GrokApp {
             _ => Provider::Local,
         };
 
+        // Drop guard that fires StreamMsg::Done if the task ends without
+        // having sent a terminal message itself. Belt-and-braces: a panic
+        // inside run_completion (e.g., a future bug we haven't seen) would
+        // otherwise leave `streaming_message_id` set forever and freeze
+        // the UI's send button. With the guard, every code path — clean,
+        // error, or panic — drops the guard which flushes a Done so the
+        // UI can recover.
+        struct DoneOnDrop {
+            tx: tokio::sync::mpsc::UnboundedSender<StreamMsg>,
+            id: Uuid,
+            fired: std::sync::atomic::AtomicBool,
+        }
+        impl DoneOnDrop {
+            fn mark_fired(&self) {
+                self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        impl Drop for DoneOnDrop {
+            fn drop(&mut self) {
+                if !self.fired.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Best-effort: receiver may already be gone if the
+                    // UI tore down the chat. That's fine — UI then has
+                    // no streaming state to clean up.
+                    let _ = self.tx.send(StreamMsg::Done(self.id));
+                }
+            }
+        }
+
         self.runtime.spawn(async move {
             // RAG augmentation runs here (off the UI thread). We use
             // spawn_blocking because fastembed::TextEmbedding is sync and
@@ -306,6 +334,11 @@ impl GrokApp {
                 system_prompt,
             };
 
+            let guard = DoneOnDrop {
+                tx: tx.clone(),
+                id: assistant_id,
+                fired: std::sync::atomic::AtomicBool::new(false),
+            };
             let result = run_completion(
                 provider_id,
                 api_key,
@@ -315,9 +348,24 @@ impl GrokApp {
                 assistant_id,
             )
             .await;
-            if let Err(e) = result {
-                let _ = tx.send(StreamMsg::Error(assistant_id, e.to_string()));
+            match result {
+                Ok(()) => {
+                    // run_completion always sends StreamMsg::Done on the
+                    // clean path before returning, so suppress the guard.
+                    guard.mark_fired();
+                }
+                Err(e) => {
+                    let _ = tx.send(StreamMsg::Error(assistant_id, e.to_string()));
+                    // The Error message itself terminates the UI's
+                    // streaming state; suppress the guard's Done so the
+                    // UI doesn't receive Done-after-Error and overwrite
+                    // the error.
+                    guard.mark_fired();
+                }
             }
+            // If we never reach either arm (panic from run_completion),
+            // `guard` drops with `fired = false` and the destructor
+            // sends a Done so the UI unblocks.
         });
     }
 

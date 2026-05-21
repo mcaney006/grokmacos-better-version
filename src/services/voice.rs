@@ -489,44 +489,53 @@ mod tests {
         .await
         .expect("open_with_url ok");
 
-        // Drain events until we see proof the disconnect surfaced. We
-        // accept any of: a `ws keepalive` error (heartbeat send failed),
-        // an `uplink` error (frame send failed), a `ws ` stream error
-        // (downlink read failed), or a `Closed` event (downlink detected
-        // close). All four are valid surface points for the same dead-WS
-        // condition; what we're proving is that a server that closes
-        // immediately after handshake never leaves the session silently
-        // hung — the user gets an actionable event within a finite time.
+        // Drain events until we see a structured Error indicating the
+        // failure was detected. Previously this test also accepted a
+        // bare `Closed` event as proof, but that's a false-positive
+        // signal: with ALL hardening removed (no keepalive ping, no
+        // receive watchdog, no send-side timeout), the downlink would
+        // STILL emit Closed naturally when stream.next() returns None
+        // after the server drops the TCP socket. The test would pass
+        // for the wrong reason.
+        //
+        // The right anti-regression assertion: we MUST see a
+        // VoiceEvent::Error within 35s — that's the surface point that
+        // only the keepalive / watchdog / send-timeout code produces.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
         let mut events_seen: Vec<String> = Vec::new();
-        let mut detected = false;
+        let mut error_signal: Option<String> = None;
+        let mut saw_closed = false;
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(200), session.events.recv()).await {
-                Ok(Some(ev)) => {
-                    let label = format!("{ev:?}");
-                    events_seen.push(label.clone());
-                    let is_signal = match &ev {
-                        VoiceEvent::Error(msg) => {
-                            msg.contains("ws keepalive")
-                                || msg.contains("uplink")
-                                || msg.starts_with("ws:")
-                                || msg.starts_with("ws ")
-                        }
-                        VoiceEvent::Closed => true,
-                        _ => false,
-                    };
-                    if is_signal {
-                        detected = true;
+                Ok(Some(VoiceEvent::Error(msg))) => {
+                    events_seen.push(format!("Error({msg:?})"));
+                    let is_keepalive_or_uplink = msg.contains("ws keepalive")
+                        || msg.contains("uplink")
+                        || msg.starts_with("ws:")
+                        || msg.starts_with("ws ");
+                    if is_keepalive_or_uplink {
+                        error_signal = Some(msg);
                         break;
                     }
+                }
+                Ok(Some(VoiceEvent::Closed)) => {
+                    events_seen.push("Closed".to_string());
+                    saw_closed = true;
+                    // Don't break on bare Closed: keep draining for the
+                    // Error event that the hardening was supposed to
+                    // emit BEFORE the natural close.
+                }
+                Ok(Some(ev)) => {
+                    events_seen.push(format!("{ev:?}"));
                 }
                 Ok(None) => break,
                 Err(_) => continue,
             }
         }
         assert!(
-            detected,
-            "expected dead-WS signal within 35s; got events: {events_seen:?}"
+            error_signal.is_some(),
+            "expected VoiceEvent::Error from keepalive/uplink/ws path within 35s; \
+             saw_closed={saw_closed}; events: {events_seen:?}"
         );
     }
 }

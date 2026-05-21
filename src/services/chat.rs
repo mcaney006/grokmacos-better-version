@@ -50,26 +50,65 @@ impl HttpPolicy {
 ///   covers pre-first-byte). The stream itself is allowed to run for
 ///   as long as the provider keeps emitting bytes.
 ///
-/// On the rare path where reqwest's builder fails (TLS backend not
-/// available, platform misconfig), we log loudly and fall back to a
-/// default `Client::new()`. The process keeps running so the rest of the
-/// app stays usable; the next request will surface whatever error
-/// reqwest itself produces. Crashing the entire process at startup —
-/// what the original `expect` did — turned an in-app diagnostic into a
-/// reboot loop, which is the wrong default.
+/// Builds the hardened client. On the rare path where reqwest's builder
+/// fails (e.g., the platform's TLS backend can't initialise), we degrade
+/// in a precise order:
+///
+/// 1. **Drop `min_tls_version`** — some embedded targets ship a rustls
+///    build that doesn't expose `min_tls_version`; the cipher list is
+///    still TLS 1.2+ by default. We keep `https_only`.
+/// 2. **Last-resort: panic.** If even the bare `Client::builder().build()`
+///    fails AND `policy.https_only` is set, refusing to run is the only
+///    safe outcome — falling back to a plain `Client::new()` would
+///    SILENTLY downgrade a cloud client to http:// + no TLS hardening,
+///    which is a way more dangerous failure mode than a startup panic.
+///    The previous version did exactly that.
+///
+/// The `LOOPBACK` policy explicitly opts in to plain HTTP for local
+/// development; it's the only case where the bare `Client::new()`
+/// fallback is acceptable.
 pub fn http_client(policy: HttpPolicy) -> Client {
-    let result = Client::builder()
-        .user_agent(concat!("grok-insane/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Some(Duration::from_secs(60)))
-        .https_only(policy.https_only)
-        .min_tls_version(reqwest::tls::Version::TLS_1_2)
-        .build();
-    match result {
+    fn build_hardened(policy: HttpPolicy, with_min_tls: bool) -> Result<Client, reqwest::Error> {
+        let mut b = Client::builder()
+            .user_agent(concat!("grok-insane/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Some(Duration::from_secs(60)))
+            .https_only(policy.https_only);
+        if with_min_tls {
+            b = b.min_tls_version(reqwest::tls::Version::TLS_1_2);
+        }
+        b.build()
+    }
+
+    match build_hardened(policy, true) {
         Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to build hardened reqwest client; falling back to default (TLS hardening DISABLED)");
-            Client::new()
+        Err(e1) => {
+            tracing::warn!(error = %e1, "hardened reqwest builder failed; retrying without min_tls_version");
+            match build_hardened(policy, false) {
+                Ok(c) => c,
+                Err(e2) => {
+                    tracing::error!(
+                        error_first = %e1,
+                        error_retry = %e2,
+                        https_only = policy.https_only,
+                        "reqwest builder failed twice"
+                    );
+                    if policy.https_only {
+                        // STRICT clients NEVER fall back to Client::new(),
+                        // which would drop https_only and ship credentials
+                        // over plaintext. A panic here is loud and visible;
+                        // a silent downgrade is the dangerous failure mode.
+                        panic!(
+                            "Cannot build a TLS-hardened HTTP client on this platform: \
+                             {e1}. Refusing to fall back to an unhardened client because \
+                             the policy requires https_only."
+                        );
+                    }
+                    // LOOPBACK policy already permits plaintext locally;
+                    // this matches what the user asked for.
+                    Client::new()
+                }
+            }
         }
     }
 }
@@ -181,6 +220,48 @@ pub(crate) const RATE_LIMIT_MAX_WAIT_SECS: u64 = 30;
 /// transport that gets nowhere in 60s is broken, not slow.
 pub(crate) const PRE_FIRST_BYTE_TIMEOUT_SECS: u64 = 60;
 
+/// Cap on the number of error-body bytes we read into a `BadStatus` for
+/// the user-facing diagnostic. A malicious / broken upstream that
+/// returns a multi-gigabyte 500 body would otherwise OOM the process
+/// via `resp.text()`. 16 KiB is plenty to fit the JSON error envelopes
+/// every real provider returns; any genuine truncation is logged.
+pub(crate) const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+
+/// Read at most `MAX_ERROR_BODY_BYTES` of the response body via the
+/// streaming API. `Response::text()` has no built-in cap; iterating the
+/// `bytes_stream` ourselves keeps memory bounded regardless of what the
+/// peer sends. Decoding is `from_utf8_lossy` so a binary error body
+/// (e.g., a misbehaving CDN serving HTML or gzip) still surfaces
+/// something human-readable.
+async fn read_capped_body(resp: reqwest::Response) -> String {
+    use futures_util::stream::StreamExt as _;
+    let mut buf = Vec::with_capacity(1024);
+    let mut stream = resp.bytes_stream();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                if buf.len() + bytes.len() > MAX_ERROR_BODY_BYTES {
+                    let room = MAX_ERROR_BODY_BYTES.saturating_sub(buf.len());
+                    buf.extend_from_slice(&bytes[..room]);
+                    truncated = true;
+                    break;
+                }
+                buf.extend_from_slice(&bytes);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "error reading body for non-success response");
+                break;
+            }
+        }
+    }
+    let mut out = String::from_utf8_lossy(&buf).into_owned();
+    if truncated {
+        out.push_str(&format!("\n[…truncated at {MAX_ERROR_BODY_BYTES} bytes]"));
+    }
+    out
+}
+
 /// Send a request with bounded pre-first-byte retry on HTTP 429. The
 /// `build`-style alternative (closure that rebuilds RequestBuilder each
 /// attempt) was simpler in shape but harder to use because
@@ -256,7 +337,7 @@ pub(crate) async fn send_with_rate_limit_retry<B: serde::Serialize>(
                 retry_after,
             });
         }
-        let body = resp.text().await.unwrap_or_default();
+        let body = read_capped_body(resp).await;
         return Err(ApiError::BadStatus {
             status: status.as_u16(),
             body,
@@ -374,6 +455,14 @@ impl SseDecoder {
             return;
         }
         while let Some(line) = self.buf.take_line() {
+            // saw_done may be flipped on by [DONE] or by the parse-failure
+            // / overflow paths below. Re-check on every iteration so a
+            // single feed call carrying data BOTH before AND after the
+            // terminator can't keep pumping events out the back of the
+            // decoder.
+            if self.saw_done {
+                break;
+            }
             if line.is_empty() {
                 continue;
             }
@@ -597,6 +686,42 @@ mod tests {
         format!("http://127.0.0.1:{port}")
     }
 
+    /// Adversarial: a hostile / broken upstream that returns a non-success
+    /// status with a multi-megabyte body must not let us pull the whole
+    /// thing into memory. The error path uses `resp.text()` to extract a
+    /// diagnostic snippet for the user; without an upstream cap, an
+    /// attacker who returns a 10 GB 500 OOMs the process.
+    ///
+    /// This test plants an 8 MB body behind a 500 status; the surfaced
+    /// `BadStatus.body` must be capped at `MAX_ERROR_BODY_BYTES`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bad_status_body_is_capped_against_oom() {
+        let huge = "x".repeat(8 * 1024 * 1024);
+        let url = spawn_mock_http(vec![MockReply {
+            status: 500,
+            headers: vec![],
+            body: huge,
+        }])
+        .await;
+        let http = http_client(HttpPolicy::LOOPBACK);
+        let err =
+            send_with_rate_limit_retry(&http, &url, &HeaderMap::new(), &serde_json::json!({}))
+                .await
+                .expect_err("500 must surface");
+        match err {
+            ApiError::BadStatus { status, body } => {
+                assert_eq!(status, 500);
+                assert!(
+                    body.len() <= MAX_ERROR_BODY_BYTES + 64,
+                    "body not capped (len {}, expected <= {})",
+                    body.len(),
+                    MAX_ERROR_BODY_BYTES + 64
+                );
+            }
+            other => panic!("expected BadStatus, got {other:?}"),
+        }
+    }
+
     /// 429 + small Retry-After → first retry succeeds with 200. Proves
     /// the retry loop both honours the header and exits the loop once
     /// the server starts cooperating.
@@ -778,6 +903,35 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("truncated"), "got {rendered}");
         assert!(rendered.contains("req-123"), "got {rendered}");
+    }
+
+    /// Adversarial #2: a SINGLE feed call whose buffer contains data
+    /// AFTER [DONE] must NOT emit events for that trailing data. The
+    /// previous fix only short-circuited the next feed() call; the
+    /// while-let line-pop loop kept iterating past the terminator
+    /// within the same call.
+    #[test]
+    fn sse_decoder_stops_iterating_lines_after_done_within_one_feed() {
+        let mut d = SseDecoder::new(None);
+        // One feed, three records: a delta, the terminator, and a
+        // trailing record that must be silently dropped.
+        d.feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"good\"}}]}\n\n\
+              data: [DONE]\n\n\
+              data: {\"choices\":[{\"delta\":{\"content\":\"poison\"}}]}\n\n",
+        );
+        let events: Vec<String> = collect_ok(&mut d)
+            .into_iter()
+            .map(|e| format!("{e:?}"))
+            .collect();
+        // First the legitimate delta, then Done. Nothing after.
+        let joined = events.join(",");
+        assert!(joined.contains("good"), "missing pre-DONE delta: {joined}");
+        assert!(joined.contains("Done"), "missing Done: {joined}");
+        assert!(
+            !joined.contains("poison"),
+            "post-DONE delta leaked through: {joined}"
+        );
     }
 
     /// Adversarial: once the decoder has reached terminal state, any

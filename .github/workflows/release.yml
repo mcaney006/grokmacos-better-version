@@ -142,6 +142,46 @@ jobs:
       - name: sign-artifacts
         run: cargo xtask ci --stage sign-artifacts
 
+      # Explicit pre-upload guard. With `if-no-files-found: warn` the
+      # upload action silently produces an empty artifact set when the
+      # build stage broke without crashing the job. Catch this BEFORE
+      # the release job downloads a void and publishes an empty
+      # GitHub Release.
+      #
+      # The check is per-matrix-row: each row must produce the artifact
+      # type its `matrix.artifact` claims, plus an SBOM. SHA256SUMS is
+      # also required (dist produces it). Missing any of these = fail
+      # the job; this is a release, not a smoke test.
+      - name: Verify expected artifacts exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          triple="${{ matrix.triple }}"
+          missing=()
+
+          case "${{ matrix.artifact }}" in
+            tar.gz)
+              ls dist/*.tar.gz                          || missing+=("dist/*.tar.gz")
+              ;;
+            zip)
+              ls dist/*.zip                             || missing+=("dist/*.zip")
+              ;;
+            dmg)
+              ls dist/"$triple"/*.dmg                   || missing+=("dist/$triple/*.dmg")
+              ;;
+          esac
+
+          ls dist/"$triple"/*.sbom.json                 || missing+=("dist/$triple/*.sbom.json")
+          ls dist/"$triple"/SHA256SUMS                  || missing+=("dist/$triple/SHA256SUMS")
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Release artifact verification FAILED. Missing:" >&2
+            for f in "${missing[@]}"; do
+              echo "  - $f" >&2
+            done
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: grok-insane-${{ matrix.triple }}
@@ -154,7 +194,7 @@ jobs:
             dist/${{ matrix.triple }}/*.sbom.json
             dist/${{ matrix.triple }}/*.cosign-bundle
             dist/${{ matrix.triple }}/SHA256SUMS
-          if-no-files-found: warn
+          if-no-files-found: error
 
   release:
     name: Publish GitHub Release
@@ -175,6 +215,54 @@ jobs:
 
       - name: List artifacts
         run: ls -laR artifacts/
+
+      # Sanity-check the downloaded artifact set BEFORE attesting +
+      # publishing. The build job's per-row verifier catches missing
+      # outputs within a row; this catches the cross-row case where one
+      # matrix entry was skipped or its upload silently emptied. We
+      # need at least one of each shippable format AND a sigstore
+      # bundle next to each one — a "release" without signatures
+      # defeats the entire supply-chain story.
+      - name: Verify download set is publishable
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+
+          dmg=( artifacts/**/*.dmg )
+          tar=( artifacts/**/*.tar.gz )
+          zip=( artifacts/**/*.zip )
+          sbom=( artifacts/**/*.sbom.json )
+          sums=( artifacts/**/SHA256SUMS )
+
+          # Every shippable artifact MUST have a cosign bundle next to it.
+          missing_sig=()
+          for art in "${dmg[@]}" "${tar[@]}" "${zip[@]}"; do
+            if [ ! -e "${art}.cosign-bundle" ] && [ ! -e "$(dirname "$art")/$(basename "$art").cosign-bundle" ]; then
+              # cosign sign-blob writes `<name>.<ext>.cosign-bundle`; also try
+              # `<name>.cosign-bundle` for older naming.
+              alt="${art%.*}.cosign-bundle"
+              if [ ! -e "$alt" ]; then
+                missing_sig+=("$art")
+              fi
+            fi
+          done
+
+          # At least one of each expected platform format must exist.
+          fail=0
+          if [ "${#dmg[@]}"  -eq 0 ]; then echo "ERROR: no .dmg artifacts"  >&2; fail=1; fi
+          if [ "${#tar[@]}"  -eq 0 ]; then echo "ERROR: no .tar.gz artifacts" >&2; fail=1; fi
+          if [ "${#zip[@]}"  -eq 0 ]; then echo "ERROR: no .zip artifacts"  >&2; fail=1; fi
+          if [ "${#sbom[@]}" -eq 0 ]; then echo "ERROR: no SBOM artifacts"  >&2; fail=1; fi
+          if [ "${#sums[@]}" -eq 0 ]; then echo "ERROR: no SHA256SUMS"      >&2; fail=1; fi
+          if [ "${#missing_sig[@]}" -gt 0 ]; then
+            echo "ERROR: missing cosign signature for:" >&2
+            for f in "${missing_sig[@]}"; do echo "  - $f" >&2; done
+            fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: Generate SLSA provenance attestation
         uses: actions/attest-build-provenance@b3e506e8c389afc651c5bacf2b8f2a1ea0557215  # v4

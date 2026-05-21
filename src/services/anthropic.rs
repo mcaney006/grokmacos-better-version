@@ -208,6 +208,13 @@ impl AnthropicDecoder {
             return;
         }
         while let Some(line) = self.buf.take_line() {
+            // Re-check terminal state per iteration: a single feed call
+            // can carry data both before AND after `message_stop`; we
+            // must not pump events out the back once the stop frame
+            // has set saw_stop.
+            if self.saw_stop {
+                break;
+            }
             if line.is_empty() {
                 continue;
             }
@@ -647,6 +654,31 @@ mod tests {
     /// arbitrary-sized chunks and assert that `feed` + `eof` + `next_event`
     /// always return cleanly.
     ///
+    /// Adversarial #2 (same as the chat decoder): a single feed call
+    /// that contains data after `message_stop` must NOT emit events
+    /// for that trailing data.
+    #[test]
+    fn anthropic_decoder_stops_iterating_lines_after_stop_within_one_feed() {
+        let mut d = AnthropicDecoder::new(None);
+        d.feed(
+            b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"good\"}}\n\n\
+              data: {\"type\":\"message_stop\"}\n\n\
+              data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"poison\"}}\n\n",
+        );
+        let events: Vec<String> = collect(&mut d)
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|e| format!("{e:?}"))
+            .collect();
+        let joined = events.join(",");
+        assert!(joined.contains("good"), "missing pre-stop delta: {joined}");
+        assert!(joined.contains("Done"), "missing Done: {joined}");
+        assert!(
+            !joined.contains("poison"),
+            "post-stop delta leaked through: {joined}"
+        );
+    }
+
     /// Adversarial: feeding bytes to a decoder that's already seen
     /// `message_stop` must not produce any new events.
     #[test]

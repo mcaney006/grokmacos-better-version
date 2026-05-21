@@ -19,31 +19,36 @@ fn dirs() -> &'static ProjectDirs {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let fallback = cwd.join(".grok-insane");
             std::fs::create_dir_all(&fallback).ok();
-            // `ProjectDirs::from_path` returns `None` for an empty path
-            // and only an empty path. Cascade through a chain of
-            // non-empty fallbacks so we can never `expect` ourselves into
-            // a process-wide panic: try the fallback dir, then "." (the
-            // current dir), then the literal "grok-insane" relative
-            // path. One of these is guaranteed non-empty.
+            // Try non-empty fallbacks in order. The first version
+            // chained an `unwrap_or_else(|| ... .unwrap())` at the end
+            // that was a tautological infinite-loop-of-failure: the
+            // outer call had already returned None, the inner call used
+            // the SAME argument value and would naturally return None
+            // too. Now each fallback uses a DIFFERENT non-empty
+            // argument; the final panic only fires if literally every
+            // attempt returned None, which would be a `directories`
+            // crate regression worth surfacing rather than papering
+            // over.
             ProjectDirs::from_path(fallback)
+                .or_else(|| ProjectDirs::from_path(PathBuf::from(APPLICATION)))
                 .or_else(|| ProjectDirs::from_path(PathBuf::from(".")))
                 .unwrap_or_else(|| {
-                    // Last resort: a single-segment relative path is
-                    // accepted by `from_path` on every platform we
-                    // support. If even THIS returns None the directories
-                    // crate has shipped a regression; surface it loudly.
-                    ProjectDirs::from_path(PathBuf::from(APPLICATION)).unwrap_or_else(|| {
-                        tracing::error!("ProjectDirs::from_path returned None for every fallback; using `.` as data root");
-                        // Build a minimal ProjectDirs against the only
-                        // value we know works: ".". `unwrap` here is
-                        // only reached after both prior `or_else` checks
-                        // failed, which would itself be a directories
-                        // crate bug. Use `unwrap_or_else` with a
-                        // panicking closure ONLY here so the diagnostic
-                        // makes it clear to ops what broke.
-                        #[allow(clippy::unwrap_used)]
-                        ProjectDirs::from_path(PathBuf::from(".")).unwrap()
-                    })
+                    tracing::error!(
+                        "ProjectDirs::from_path returned None for the fallback dir, \
+                         the literal {APPLICATION:?}, and \".\". This is a directories \
+                         crate regression — please file an issue."
+                    );
+                    // We've exhausted our options. Panicking here is
+                    // genuinely the right outcome: the only alternative
+                    // is to fabricate a ProjectDirs by transmute, which
+                    // would be unsafe AND wrong.
+                    #[allow(clippy::expect_used)]
+                    {
+                        panic!(
+                            "ProjectDirs::from_path returned None for all fallbacks; \
+                             cannot resolve any data directory on this platform"
+                        );
+                    }
                 })
         })
     })
