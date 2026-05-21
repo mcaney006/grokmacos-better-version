@@ -172,24 +172,62 @@ pub(crate) fn sbom() -> Result<()> {
     let out_dir = workspace_root().join("dist").join(host_target_triple());
     std::fs::create_dir_all(&out_dir).context("create dist dir")?;
 
+    // cargo-cyclonedx writes one SBOM PER workspace member at the
+    // crate root (and at each member's directory). With our two
+    // members (grok-insane + xtask) that's:
+    //   <root>/grok-insane-sbom.json    (the main crate, what we ship)
+    //   <root>/xtask/grok-insane-sbom.json   (xtask — discarded below)
+    //
+    // The previous code looked for `grok-insane-sbom.cdx.json`. That
+    // was the right name for cargo-cyclonedx <= 0.4; 0.5 writes plain
+    // `<override>.json` when `--format json`. The wrong extension meant
+    // `if src.exists()` was always false → silent no-op → release
+    // workflow's "Verify expected artifacts exist" step failed because
+    // nothing landed at `dist/<triple>/*.sbom.json`. We now hard-fail
+    // if the expected file is absent — silent failure on a release
+    // pipeline is the worst outcome.
     cargo([
         "cyclonedx",
         "--format",
         "json",
         "--override-filename",
         "grok-insane-sbom",
+        // Scope to the main crate; xtask is a developer tool, not a
+        // shipped binary, and a per-member SBOM file pollutes the
+        // workspace root regardless.
+        "--manifest-path",
+        workspace_root()
+            .join("Cargo.toml")
+            .to_str()
+            .context("workspace Cargo.toml path is not utf-8")?,
     ])?;
 
-    let src = workspace_root().join("grok-insane-sbom.cdx.json");
+    let src = workspace_root().join("grok-insane-sbom.json");
     let dst = out_dir.join(format!(
         "grok-insane-{}.sbom.json",
         env!("CARGO_PKG_VERSION")
     ));
-    if src.exists() {
-        std::fs::rename(&src, &dst)
-            .with_context(|| format!("move {} -> {}", src.display(), dst.display()))?;
-        println!("sbom: {}", dst.display());
+    if !src.exists() {
+        bail!(
+            "expected SBOM at {} but cargo-cyclonedx did not produce it. \
+             Run `cargo cyclonedx -vv --format json --override-filename grok-insane-sbom` \
+             from the workspace root and check where the output actually lands; \
+             cargo-cyclonedx changes its output naming between minor versions.",
+            src.display()
+        );
     }
+    std::fs::rename(&src, &dst)
+        .with_context(|| format!("move {} -> {}", src.display(), dst.display()))?;
+
+    // Clean up the per-member SBOM at xtask/ — it's not a shipped
+    // artifact and leaving it in the worktree breaks `git status` on
+    // a release runner.
+    let xtask_extra = workspace_root().join("xtask").join("grok-insane-sbom.json");
+    if xtask_extra.exists() {
+        let _ = std::fs::remove_file(&xtask_extra);
+    }
+
+    println!("sbom: {}", dst.display());
     Ok(())
 }
 

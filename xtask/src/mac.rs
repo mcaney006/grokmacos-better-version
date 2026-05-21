@@ -52,30 +52,60 @@ pub(crate) fn sign() -> Result<()> {
     }
     let identity = env::var("APPLE_DEVELOPER_ID_APPLICATION").ok();
 
+    // Two codesign invocation shapes:
+    //
+    //   (a) Real Developer ID identity present →
+    //         --options runtime --timestamp --entitlements <plist>
+    //         --sign "<Developer ID Application: ...>"
+    //       The full hardened-runtime + secure-timestamp + entitlements
+    //       set Apple expects for notarization.
+    //
+    //   (b) Ad-hoc (no identity) →
+    //         --sign -
+    //       Just enough to make the bundle openable. We deliberately
+    //       DROP `--timestamp` because codesign on Xcode 15+ errors
+    //       out with `--timestamp` + `--sign -` (the timestamp service
+    //       requires a real cert chain). The previous code passed
+    //       `--timestamp` unconditionally; macOS release jobs without
+    //       Apple secrets failed silently after the keychain step.
+    //       We also drop `--options runtime` + `--entitlements` for
+    //       ad-hoc because the hardened-runtime ticket only matters
+    //       under a real signature; layering it on an ad-hoc sig
+    //       gains us nothing and increases the chance of a future
+    //       codesign quirk failing the build.
+    //       `--deep` is kept on both: the .app contains the binary
+    //       at Contents/MacOS/grok-insane and we want it signed too.
     let mut cmd = Command::new("codesign");
-    cmd.arg("--force")
-        .arg("--deep")
-        .arg("--options")
-        .arg("runtime")
-        .arg("--timestamp")
-        .arg("--entitlements")
-        .arg(&entitlements);
+    cmd.arg("--force").arg("--deep");
     match identity.as_deref() {
         Some(id) if !id.is_empty() => {
-            cmd.arg("--sign").arg(id);
-            println!("sign: codesigning with `{id}`");
+            cmd.arg("--options")
+                .arg("runtime")
+                .arg("--timestamp")
+                .arg("--entitlements")
+                .arg(&entitlements)
+                .arg("--sign")
+                .arg(id);
+            println!("sign: codesigning with `{id}` (hardened runtime + timestamp)");
         }
         _ => {
             cmd.arg("--sign").arg("-");
             eprintln!(
                 "sign: APPLE_DEVELOPER_ID_APPLICATION not set — using ad-hoc signature.\n\
-                 The resulting .app will trigger Gatekeeper warnings on other Macs."
+                 The resulting .app will trigger Gatekeeper warnings on other Macs.\n\
+                 Hardened-runtime / timestamp / entitlements skipped because they\n\
+                 require a real Developer ID and codesign errors when combined\n\
+                 with `--sign -` on Xcode 15+."
             );
         }
     }
     cmd.arg(&app);
     run_cmd(&mut cmd)?;
 
+    // `--verify --strict` against an ad-hoc bundle is fine — strict
+    // checks the signature is internally consistent, not that it
+    // chains to a trusted CA. spctl is the assess-trust step and is
+    // only run as part of `notarize()`.
     let mut verify = Command::new("codesign");
     verify
         .arg("--verify")
