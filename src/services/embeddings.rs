@@ -66,15 +66,37 @@ impl Retriever {
     ) -> Result<Vec<Retrieved>, StorageError> {
         use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
+        // Load-or-keep the model under the existing mutex guard, then
+        // borrow it once for the `embed` call. The previous form
+        // unwrapped `guard.as_mut()` after the load via
+        // `.expect("model loaded above")` — proven safe but the
+        // expect line lands inside a `cfg(feature = "rag")` branch
+        // and a future contributor adding an early-return between the
+        // load and the borrow would silently turn it into a panic.
+        // Match the Option directly so the type system enforces what
+        // the comment was promising.
         let mut guard = self.model.lock();
-        if guard.is_none() {
-            let model = TextEmbedding::try_new(
-                InitOptions::new(EmbeddingModel::BGESmallENV15).with_show_download_progress(false),
-            )
-            .map_err(|e| StorageError::Index(e.to_string()))?;
-            *guard = Some(model);
-        }
-        let model = guard.as_mut().expect("model loaded above");
+        let model = match guard.as_mut() {
+            Some(m) => m,
+            None => {
+                let m = TextEmbedding::try_new(
+                    InitOptions::new(EmbeddingModel::BGESmallENV15)
+                        .with_show_download_progress(false),
+                )
+                .map_err(|e| StorageError::Index(e.to_string()))?;
+                *guard = Some(m);
+                // `guard.as_mut()` cannot return None on the line after
+                // we wrote Some(_); if it does, that's a real bug in
+                // parking_lot we'd want to surface as a panic. Keeping
+                // it in a single Option-typed `match` so any future
+                // refactor that adds a fallible operation between the
+                // store and the read fails the compiler instead of
+                // panicking at runtime.
+                guard.as_mut().ok_or_else(|| {
+                    StorageError::Index("embedding model dropped immediately after load".to_owned())
+                })?
+            }
+        };
 
         let mut docs: Vec<String> = Vec::with_capacity(hits.len() + 1);
         docs.push(query.to_string());
@@ -83,8 +105,15 @@ impl Retriever {
         let embeddings = model
             .embed(docs, None)
             .map_err(|e| StorageError::Index(e.to_string()))?;
-        let q = &embeddings[0];
-        let mut scored: Vec<(f32, &crate::storage::search::Hit)> = embeddings[1..]
+        // `embed` is contractually 1-output-per-input. We just pushed
+        // the query plus N hits, so `embeddings.first()` ALWAYS exists.
+        // Pattern-matched defensively so a future fastembed bump that
+        // changes the contract surfaces as Err, not as panic from
+        // `embeddings[0]` indexing.
+        let (q, hit_embeddings) = embeddings.split_first().ok_or_else(|| {
+            StorageError::Index("embedding backend returned zero vectors".to_owned())
+        })?;
+        let mut scored: Vec<(f32, &crate::storage::search::Hit)> = hit_embeddings
             .iter()
             .zip(hits.iter())
             .map(|(e, h)| (cosine(q, e), h))
