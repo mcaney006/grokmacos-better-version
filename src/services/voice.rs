@@ -44,6 +44,14 @@ const WS_PING_INTERVAL_SECS: u64 = 30;
 const WS_RECV_WATCHDOG_INTERVAL_SECS: u64 = 60;
 const WS_RECV_DEADLINE_SECS: i64 = 90;
 
+/// Per-`sink.send()` cap on the uplink. The receive watchdog catches
+/// the case where the server stops sending; this catches the inverse
+/// (server keeps the socket open but stops reading, so our writes
+/// block in the kernel send buffer). 15s is way longer than any
+/// healthy provider's window — well-behaved peers ACK within ms — so
+/// it's only ever tripped by a broken transport.
+const WS_SEND_TIMEOUT_SECS: u64 = 15;
+
 fn epoch_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -141,7 +149,13 @@ impl VoiceSession {
         let capture_rx = shared.capture_rx.clone();
         let (forward_tx, mut forward_rx) =
             tokio::sync::mpsc::channel::<Vec<i16>>(VOICE_UPLINK_CHANNEL_DEPTH);
-        std::thread::Builder::new()
+        // OS thread create can fail under memory pressure / fd exhaustion.
+        // The previous code dropped the Result with `.ok()`, which meant
+        // a failed spawn silently produced a voice session that captured
+        // audio but never uplinked it. Now we surface the failure as an
+        // error event so the UI tells the user and tears the session
+        // down instead of pretending it's healthy.
+        let bridge_result = std::thread::Builder::new()
             .name("voice-uplink-bridge".into())
             .spawn(move || {
                 while let Ok(frame) = capture_rx.recv() {
@@ -157,8 +171,12 @@ impl VoiceSession {
                         }
                     }
                 }
-            })
-            .ok();
+            });
+        if let Err(e) = bridge_result {
+            return Err(ApiError::WebSocket(format!(
+                "voice uplink bridge thread spawn failed: {e}"
+            )));
+        }
 
         let uplink_events = events_tx.clone();
         let uplink = tokio::spawn(async move {
@@ -170,6 +188,7 @@ impl VoiceSession {
                 tokio::time::interval(std::time::Duration::from_secs(WS_PING_INTERVAL_SECS));
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+            let send_dur = std::time::Duration::from_secs(WS_SEND_TIMEOUT_SECS);
             loop {
                 tokio::select! {
                     maybe_frame = forward_rx.recv() => {
@@ -183,17 +202,51 @@ impl VoiceSession {
                             "type": "input_audio_buffer.append",
                             "audio": b64,
                         });
-                        if let Err(e) = sink.send(WsMessage::Text(event.to_string().into())).await {
-                            let _ = uplink_events.send(VoiceEvent::Error(format!("uplink: {e}")));
-                            break;
+                        // Bound sink.send: a server that ACKs Pongs but
+                        // stops reading our payload bytes would otherwise
+                        // hang us in the kernel send buffer indefinitely.
+                        // The receive-watchdog can't see this — only a
+                        // send-side timeout can.
+                        match tokio::time::timeout(
+                            send_dur,
+                            sink.send(WsMessage::Text(event.to_string().into())),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                let _ = uplink_events
+                                    .send(VoiceEvent::Error(format!("uplink: {e}")));
+                                break;
+                            }
+                            Err(_) => {
+                                let _ = uplink_events.send(VoiceEvent::Error(format!(
+                                    "uplink: send timed out after {WS_SEND_TIMEOUT_SECS}s (server not reading)"
+                                )));
+                                break;
+                            }
                         }
                     }
                     _ = heartbeat.tick() => {
-                        if let Err(e) = sink.send(WsMessage::Ping(Default::default())).await {
-                            let _ = uplink_events.send(VoiceEvent::Error(
-                                format!("ws keepalive: {e}")
-                            ));
-                            break;
+                        match tokio::time::timeout(
+                            send_dur,
+                            sink.send(WsMessage::Ping(Default::default())),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                let _ = uplink_events.send(VoiceEvent::Error(format!(
+                                    "ws keepalive: {e}"
+                                )));
+                                break;
+                            }
+                            Err(_) => {
+                                let _ = uplink_events.send(VoiceEvent::Error(format!(
+                                    "ws keepalive: ping send timed out after {WS_SEND_TIMEOUT_SECS}s"
+                                )));
+                                break;
+                            }
                         }
                     }
                 }

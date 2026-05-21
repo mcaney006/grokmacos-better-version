@@ -562,7 +562,9 @@ impl SincResampler {
     }
 
     fn make_inner(ratio: f64) -> Result<rubato::SincFixedIn<f32>, String> {
-        use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+        use rubato::{
+            SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+        };
         let params = SincInterpolationParameters {
             // f_cutoff = 0.95: standard anti-alias margin below Nyquist.
             // sinc_len = 256: ample stopband attenuation, ~5 ms of pre-ring.

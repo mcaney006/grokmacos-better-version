@@ -933,8 +933,25 @@ async fn run_completion(
                 // the markdown view and shows up verbatim in the chat
                 // log. When the proper tool-runner ships, this passes
                 // through a structured StreamMsg::ToolUse instead.
+                //
+                // Backtick injection guard: if the model returns a tool
+                // input whose string fields contain ``` we'd break out
+                // of our fence and the trailing characters would render
+                // as markdown prose (potentially rendering attacker-
+                // controlled HTML if commonmark allows it). Use a
+                // tilde-fence and escape any literal tilde-fences in
+                // the serialised input. Both `id` and `name` are bound
+                // by the wire schema to ASCII identifiers; we sanitise
+                // them defensively anyway.
                 tracing::info!(%id, %name, ?input, "anthropic tool_use");
-                let rendered = format!("\n```tool-use\n{name} ({id}): {input}\n```\n");
+                let safe_input = input
+                    .to_string()
+                    .replace("~~~", "~ ~ ~")
+                    .replace("```", "` ` `");
+                let safe_name = name.replace(['\n', '\r', '`', '~'], " ");
+                let safe_id = id.replace(['\n', '\r', '`', '~'], " ");
+                let rendered =
+                    format!("\n~~~tool-use\n{safe_name} ({safe_id}): {safe_input}\n~~~\n");
                 let _ = tx.send(StreamMsg::Delta(assistant_id, rendered));
             }
             Ok(ChatEvent::Usage { input, output }) => {

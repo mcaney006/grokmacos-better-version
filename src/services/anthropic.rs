@@ -83,13 +83,9 @@ impl ChatProvider for AnthropicClient {
         );
 
         let url = format!("{}/messages", self.base.trim_end_matches('/'));
-        let resp = crate::services::chat::send_with_rate_limit_retry(
-            &self.http,
-            &url,
-            &headers,
-            &body,
-        )
-        .await?;
+        let resp =
+            crate::services::chat::send_with_rate_limit_retry(&self.http, &url, &headers, &body)
+                .await?;
 
         let request_id = crate::services::chat::extract_request_id(resp.headers());
         let stream = resp.bytes_stream();
@@ -199,6 +195,11 @@ impl AnthropicDecoder {
 
     fn feed(&mut self, bytes: &[u8]) {
         use crate::services::sse::BufferStatus;
+        // Mirror chat.rs: drop bytes once the stream has reached terminal
+        // state (clean stop, provider error, truncation, parse overflow).
+        if self.saw_stop {
+            return;
+        }
         if self.buf.extend(bytes) == BufferStatus::Overflow {
             self.push_truncation(format!(
                 "SSE line buffer exceeded {} bytes",
@@ -646,6 +647,39 @@ mod tests {
     /// arbitrary-sized chunks and assert that `feed` + `eof` + `next_event`
     /// always return cleanly.
     ///
+    /// Adversarial: feeding bytes to a decoder that's already seen
+    /// `message_stop` must not produce any new events.
+    #[test]
+    fn anthropic_decoder_drops_bytes_fed_after_stop() {
+        let mut d = AnthropicDecoder::new(None);
+        d.feed(b"data: {\"type\":\"message_stop\"}\n\n");
+        // Drain Usage + Done.
+        while let Some(e) = d.next_event() {
+            assert!(e.is_ok(), "unexpected error during clean drain: {e:?}");
+        }
+        d.feed(b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"poison\"}}\n\n");
+        assert!(d.next_event().is_none(), "post-stop bytes leaked an event");
+    }
+
+    /// Adversarial: an oversized line (no `\n` within budget) must
+    /// surface as a `StreamTruncated`, not OOM the process.
+    #[test]
+    fn anthropic_decoder_oversize_line_surfaces_truncation() {
+        let mut d = AnthropicDecoder::new(Some("req-anthropic-overflow".into()));
+        let huge = vec![b'x'; crate::services::sse::LINE_BUDGET_BYTES + 1];
+        d.feed(&huge);
+        let err = d
+            .next_event()
+            .expect("expected truncation after overflow")
+            .expect_err("expected Err");
+        let rendered = err.to_string();
+        assert!(rendered.contains("truncated"), "got {rendered}");
+        assert!(
+            rendered.contains("req-anthropic-overflow"),
+            "got {rendered}"
+        );
+    }
+
     /// Streaming tool_use: `content_block_start` carries the id+name,
     /// `input_json_delta` fragments are concatenated, and a single
     /// `ChatEvent::ToolUse` with the parsed input is emitted at

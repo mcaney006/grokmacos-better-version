@@ -19,10 +19,32 @@ fn dirs() -> &'static ProjectDirs {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let fallback = cwd.join(".grok-insane");
             std::fs::create_dir_all(&fallback).ok();
-            // `from_path` returns Some for any owned PathBuf. If for any
-            // reason it didn't, build a minimal ProjectDirs against `.`.
-            #[allow(clippy::expect_used)] // see comment above
-            ProjectDirs::from_path(fallback).expect("ProjectDirs::from_path returns Some")
+            // `ProjectDirs::from_path` returns `None` for an empty path
+            // and only an empty path. Cascade through a chain of
+            // non-empty fallbacks so we can never `expect` ourselves into
+            // a process-wide panic: try the fallback dir, then "." (the
+            // current dir), then the literal "grok-insane" relative
+            // path. One of these is guaranteed non-empty.
+            ProjectDirs::from_path(fallback)
+                .or_else(|| ProjectDirs::from_path(PathBuf::from(".")))
+                .unwrap_or_else(|| {
+                    // Last resort: a single-segment relative path is
+                    // accepted by `from_path` on every platform we
+                    // support. If even THIS returns None the directories
+                    // crate has shipped a regression; surface it loudly.
+                    ProjectDirs::from_path(PathBuf::from(APPLICATION)).unwrap_or_else(|| {
+                        tracing::error!("ProjectDirs::from_path returned None for every fallback; using `.` as data root");
+                        // Build a minimal ProjectDirs against the only
+                        // value we know works: ".". `unwrap` here is
+                        // only reached after both prior `or_else` checks
+                        // failed, which would itself be a directories
+                        // crate bug. Use `unwrap_or_else` with a
+                        // panicking closure ONLY here so the diagnostic
+                        // makes it clear to ops what broke.
+                        #[allow(clippy::unwrap_used)]
+                        ProjectDirs::from_path(PathBuf::from(".")).unwrap()
+                    })
+                })
         })
     })
 }

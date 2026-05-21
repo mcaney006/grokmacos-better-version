@@ -3,9 +3,9 @@
 //! polite no-op stubs so the orchestration in `release()` stays identical
 //! across runners.
 
-use crate::{host_target_triple, workspace_root};
 #[cfg(target_os = "macos")]
 use crate::run_cmd;
+use crate::{host_target_triple, workspace_root};
 use anyhow::Result;
 #[cfg(target_os = "macos")]
 use anyhow::{bail, Context};

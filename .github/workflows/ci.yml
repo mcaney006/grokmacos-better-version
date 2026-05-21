@@ -96,3 +96,57 @@ jobs:
           name: xtask-metrics-${{ matrix.os }}
           path: dist/xtask-metrics.jsonl
           if-no-files-found: ignore
+
+  # Feature matrix: prove the code still builds + tests cleanly when
+  # someone flips the optional features on (or strips defaults). Without
+  # this, `--features hq-resample` could rot silently between commits
+  # because the default CI path never exercises it.
+  features:
+    name: features (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { features: "--no-default-features",       label: "no-default-features" }
+          - { features: "--features hq-resample",      label: "hq-resample" }
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: "1.94.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          shared-key: features-${{ matrix.label }}
+      - name: install OS deps
+        run: cargo xtask ci --stage install-deps
+      - name: clippy
+        run: cargo clippy --workspace --all-targets ${{ matrix.features }} -- -D warnings
+      - name: test
+        run: cargo test --workspace ${{ matrix.features }} --locked
+
+  # Doc build catches broken intra-doc links, malformed doctests, and
+  # crate-graph misconfiguration. Cheap + high-signal. `RUSTDOCFLAGS=-D
+  # warnings` turns every rustdoc lint into a hard failure.
+  doc:
+    name: doc (no broken links)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: "1.94.0"
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          shared-key: doc
+      - name: install OS deps
+        run: cargo xtask ci --stage install-deps
+      - name: doc
+        run: cargo doc --workspace --no-deps --document-private-items

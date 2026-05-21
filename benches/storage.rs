@@ -66,7 +66,11 @@ fn bench_search(c: &mut Criterion) {
         let phrase = phrases[i % phrases.len()];
         let msg = Message::new(
             chat.id,
-            if i % 2 == 0 { Role::User } else { Role::Assistant },
+            if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            },
             format!("{phrase} ({i})"),
         );
         store.insert_message(&msg).expect("seed insert");

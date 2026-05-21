@@ -118,11 +118,28 @@ impl Store {
 
     // ---- settings -----------------------------------------------------------
 
+    /// Load persisted settings, or `Settings::default()` if none have been
+    /// saved yet. Crucially, a decode failure (e.g., a saved blob from a
+    /// previous binary where `Settings` had different fields — bincode
+    /// is positional and not forward-compatible by default) also returns
+    /// the default. The previous behaviour propagated the decode error,
+    /// which bricked the app for any user that upgraded across a schema
+    /// change. Logging + reset is the only correct posture: the user
+    /// can re-enter preferences; the app boots.
     pub fn load_settings(&self) -> Result<Settings, StorageError> {
         let read = self.inner.db.begin_read()?;
         let meta = read.open_table(TBL_META)?;
         match meta.get(META_SETTINGS)? {
-            Some(v) => bincode_deserialize::<Settings>(v.value()),
+            Some(v) => match bincode_deserialize::<Settings>(v.value()) {
+                Ok(s) => Ok(s),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "saved settings blob failed to decode; reverting to defaults (likely a schema upgrade)"
+                    );
+                    Ok(Settings::default())
+                }
+            },
             None => Ok(Settings::default()),
         }
     }
@@ -305,6 +322,35 @@ mod tests {
 
     fn open_store(dir: &std::path::Path) -> Store {
         Store::open(&dir.join("db.redb"), &dir.join("index")).expect("open")
+    }
+
+    /// Regression: a corrupted / older-schema Settings blob in redb
+    /// must not brick the app. The previous code returned a decode
+    /// error to the caller, which made every UI surface (including the
+    /// settings panel itself) un-renderable. Now we log and fall back
+    /// to defaults so the user can boot and fix.
+    #[test]
+    fn settings_decode_failure_falls_back_to_defaults() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+
+        // Plant a bogus settings blob directly via the storage API.
+        // bincode is positional, so a one-byte payload definitely won't
+        // decode into the multi-field `Settings` struct.
+        let write = store.inner.db.begin_write().unwrap();
+        {
+            let mut meta = write.open_table(TBL_META).unwrap();
+            meta.insert(META_SETTINGS, &[0xFFu8][..]).unwrap();
+        }
+        write.commit().unwrap();
+
+        // Load must succeed with defaults, not propagate the decode error.
+        let loaded = store
+            .load_settings()
+            .expect("decode failure should fall back, not propagate");
+        let defaults = Settings::default();
+        assert_eq!(loaded.default_provider, defaults.default_provider);
+        assert_eq!(loaded.xai_model, defaults.xai_model);
     }
 
     #[test]

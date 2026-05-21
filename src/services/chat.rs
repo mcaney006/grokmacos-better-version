@@ -41,19 +41,37 @@ impl HttpPolicy {
 /// * `https_only` per the policy. Most providers want it true.
 /// * Tight `connect_timeout` so DNS or TCP stalls fail fast instead of
 ///   keeping a half-open socket around.
-/// * Overall `timeout` caps any single request — guards against a malicious
-///   or buggy server holding the stream open forever.
+/// * **No** overall `.timeout()`. The original config set 120s, which
+///   reqwest applies to the *entire* request including streaming body
+///   read. A long Claude / Grok answer can legitimately stream for
+///   several minutes; we'd kill it mid-token. Instead we enforce
+///   `connect_timeout` (so a dead server is rejected fast) plus a
+///   per-attempt cap inside `send_with_rate_limit_retry` (which only
+///   covers pre-first-byte). The stream itself is allowed to run for
+///   as long as the provider keeps emitting bytes.
+///
+/// On the rare path where reqwest's builder fails (TLS backend not
+/// available, platform misconfig), we log loudly and fall back to a
+/// default `Client::new()`. The process keeps running so the rest of the
+/// app stays usable; the next request will surface whatever error
+/// reqwest itself produces. Crashing the entire process at startup —
+/// what the original `expect` did — turned an in-app diagnostic into a
+/// reboot loop, which is the wrong default.
 pub fn http_client(policy: HttpPolicy) -> Client {
-    #[allow(clippy::expect_used)] // Builder failure is a process-wide misconfig at startup
-    Client::builder()
+    let result = Client::builder()
         .user_agent(concat!("grok-insane/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(120))
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(Some(Duration::from_secs(60)))
         .https_only(policy.https_only)
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
-        .build()
-        .expect("reqwest client")
+        .build();
+    match result {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build hardened reqwest client; falling back to default (TLS hardening DISABLED)");
+            Client::new()
+        }
+    }
 }
 
 // The line-budget guard moved into `services::sse::LINE_BUDGET_BYTES`
@@ -156,6 +174,13 @@ pub(crate) const RATE_LIMIT_RETRY_ATTEMPTS: usize = 3;
 /// app — we cap, retry once, then surface the error.
 pub(crate) const RATE_LIMIT_MAX_WAIT_SECS: u64 = 30;
 
+/// Per-attempt cap for the pre-first-byte send. Bounds DNS + TCP + TLS +
+/// HTTP-headers wait, but NOT the stream body (the stream itself can run
+/// for as long as the provider keeps emitting tokens). 60s is generous
+/// enough that providers under modest load still complete; a hanging
+/// transport that gets nowhere in 60s is broken, not slow.
+pub(crate) const PRE_FIRST_BYTE_TIMEOUT_SECS: u64 = 60;
+
 /// Send a request with bounded pre-first-byte retry on HTTP 429. The
 /// `build`-style alternative (closure that rebuilds RequestBuilder each
 /// attempt) was simpler in shape but harder to use because
@@ -174,12 +199,28 @@ pub(crate) async fn send_with_rate_limit_retry<B: serde::Serialize>(
 ) -> Result<reqwest::Response, ApiError> {
     let mut attempt = 0usize;
     loop {
-        let resp = http
-            .post(url)
-            .headers(headers.clone())
-            .json(body)
-            .send()
-            .await?;
+        // Bound the pre-first-byte send via `tokio::time::timeout`, NOT
+        // reqwest's RequestBuilder::timeout — the latter applies to the
+        // entire request including the body, which would kill our
+        // streaming response. `Client::send().await` resolves as soon as
+        // the response status + headers arrive (per reqwest's docs), so
+        // wrapping the future itself bounds only the pre-body wait.
+        let send_fut = http.post(url).headers(headers.clone()).json(body).send();
+        let resp = match tokio::time::timeout(
+            std::time::Duration::from_secs(PRE_FIRST_BYTE_TIMEOUT_SECS),
+            send_fut,
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(ApiError::Http(e)),
+            Err(_elapsed) => {
+                return Err(ApiError::InvalidResponse(format!(
+                    "request timed out before response headers ({}s)",
+                    PRE_FIRST_BYTE_TIMEOUT_SECS
+                )));
+            }
+        };
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
@@ -317,6 +358,14 @@ impl SseDecoder {
 
     fn feed(&mut self, bytes: &[u8]) {
         use crate::services::sse::BufferStatus;
+        // Once we've decided the stream is over (clean DONE, provider
+        // error, truncation, or parse-failure overflow), drop subsequent
+        // bytes on the floor. Callers SHOULD stop feeding after they see
+        // an Err / Done, but a defensive guard here prevents a buggy
+        // caller from re-driving the parser past terminal state.
+        if self.saw_done {
+            return;
+        }
         if self.buf.extend(bytes) == BufferStatus::Overflow {
             self.push_truncation(format!(
                 "SSE line buffer exceeded {} bytes",
@@ -461,6 +510,185 @@ struct Usage {
 mod tests {
     use super::*;
 
+    /// One scripted reply from `spawn_mock_http`. Wrapped in a struct so
+    /// the test signature stays under clippy's `type_complexity` lint.
+    #[derive(Clone)]
+    struct MockReply {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    /// Mock HTTP server that returns one or more pre-canned responses
+    /// to POST requests. Used by the rate-limit + bad-status tests to
+    /// drive `send_with_rate_limit_retry` against a real network stack
+    /// without depending on the public internet.
+    ///
+    /// On each inbound request the server pops the front of `responses`
+    /// and serves it. When only one entry remains it serves that one
+    /// indefinitely (useful for the "always 429" / "always 500" cases).
+    async fn spawn_mock_http(responses: Vec<MockReply>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let responses = std::sync::Arc::new(parking_lot::Mutex::new(responses));
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let responses = responses.clone();
+                tokio::spawn(async move {
+                    // Drain request bytes until we see "\r\n\r\n" — naive
+                    // but fine for our short JSON POSTs.
+                    let mut buf = [0u8; 8192];
+                    let mut total = Vec::new();
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        total.extend_from_slice(&buf[..n]);
+                        if total.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let next = {
+                        let mut q = responses.lock();
+                        if q.len() > 1 {
+                            q.remove(0)
+                        } else if let Some(last) = q.first() {
+                            last.clone()
+                        } else {
+                            MockReply {
+                                status: 500,
+                                headers: vec![],
+                                body: "no canned response".to_string(),
+                            }
+                        }
+                    };
+                    let MockReply {
+                        status,
+                        headers,
+                        body,
+                    } = next;
+                    let status_text = match status {
+                        200 => "OK",
+                        429 => "Too Many Requests",
+                        500 => "Internal Server Error",
+                        _ => "Error",
+                    };
+                    let mut resp = format!("HTTP/1.1 {status} {status_text}\r\n");
+                    resp.push_str(&format!("Content-Length: {}\r\n", body.len()));
+                    resp.push_str("Connection: close\r\n");
+                    for (k, v) in &headers {
+                        resp.push_str(&format!("{k}: {v}\r\n"));
+                    }
+                    resp.push_str("\r\n");
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        // Let the listener register.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// 429 + small Retry-After → first retry succeeds with 200. Proves
+    /// the retry loop both honours the header and exits the loop once
+    /// the server starts cooperating.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rate_limit_retry_honours_retry_after_then_succeeds() {
+        let url = spawn_mock_http(vec![
+            MockReply {
+                status: 429,
+                headers: vec![("Retry-After".into(), "1".into())],
+                body: "slow down".into(),
+            },
+            MockReply {
+                status: 200,
+                headers: vec![],
+                body: "ok".into(),
+            },
+        ])
+        .await;
+        let http = http_client(HttpPolicy::LOOPBACK);
+        let body = serde_json::json!({"hello": "world"});
+        let started = std::time::Instant::now();
+        let resp = send_with_rate_limit_retry(&http, &url, &HeaderMap::new(), &body)
+            .await
+            .expect("retry should succeed on the second attempt");
+        let elapsed = started.elapsed();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "expected ~1s Retry-After honoured, got {elapsed:?}"
+        );
+    }
+
+    /// Sustained 429s burn through RATE_LIMIT_RETRY_ATTEMPTS and then
+    /// surface as `ApiError::RateLimited` with the parsed Retry-After.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rate_limit_retry_gives_up_after_budget_and_classifies_correctly() {
+        // Tiny Retry-After so the test doesn't take forever.
+        let responses = vec![
+            MockReply {
+                status: 429,
+                headers: vec![("Retry-After".into(), "0".into())],
+                body: "limit".into(),
+            };
+            RATE_LIMIT_RETRY_ATTEMPTS + 1
+        ];
+        let url = spawn_mock_http(responses).await;
+        let http = http_client(HttpPolicy::LOOPBACK);
+        let err =
+            send_with_rate_limit_retry(&http, &url, &HeaderMap::new(), &serde_json::json!({}))
+                .await
+                .expect_err("should have surrendered after retry budget");
+        match err {
+            ApiError::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(0)));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    /// Non-429 errors do NOT enter the retry loop — they short-circuit
+    /// as `BadStatus`. Guards against accidentally retrying a 500 (which
+    /// is usually NOT idempotent on the server's side) just because the
+    /// loop body was copy-pasted carelessly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rate_limit_retry_does_not_retry_500() {
+        let url = spawn_mock_http(vec![
+            MockReply {
+                status: 500,
+                headers: vec![],
+                body: "boom".into(),
+            };
+            5
+        ])
+        .await;
+        let http = http_client(HttpPolicy::LOOPBACK);
+        let started = std::time::Instant::now();
+        let err =
+            send_with_rate_limit_retry(&http, &url, &HeaderMap::new(), &serde_json::json!({}))
+                .await
+                .expect_err("500 must surface");
+        let elapsed = started.elapsed();
+        // First-attempt failure: well under one Retry-After cycle.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "500 was retried (took {elapsed:?})"
+        );
+        match err {
+            ApiError::BadStatus { status, .. } => assert_eq!(status, 500),
+            other => panic!("expected BadStatus, got {other:?}"),
+        }
+    }
+
     fn collect_ok(d: &mut SseDecoder) -> Vec<ChatEvent> {
         let mut out = Vec::new();
         while let Some(item) = d.next_event() {
@@ -550,6 +778,52 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("truncated"), "got {rendered}");
         assert!(rendered.contains("req-123"), "got {rendered}");
+    }
+
+    /// Adversarial: once the decoder has reached terminal state, any
+    /// further bytes fed to it must be dropped — not parsed, not
+    /// allocated through the line buffer, not surfaced as new events.
+    /// Protects against a buggy caller that keeps draining the upstream
+    /// stream past the [DONE] terminator.
+    #[test]
+    fn sse_decoder_drops_bytes_fed_after_done() {
+        let mut d = SseDecoder::new(None);
+        d.feed(b"data: [DONE]\n\n");
+        // Drain the terminal Done.
+        let _ = d.next_event();
+        // Now slam 1 MB of garbage at it.
+        let garbage = vec![b'x'; 1_000_000];
+        d.feed(&garbage);
+        d.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"poison\"}}]}\n\n");
+        // No further events must materialise.
+        assert!(d.next_event().is_none(), "post-Done bytes leaked an event");
+    }
+
+    /// Adversarial: oversized line (no `\n` within LINE_BUDGET_BYTES)
+    /// must surface as a `StreamTruncated` error instead of growing the
+    /// buffer without bound. Tests the byte-line buffer's overflow
+    /// guard end-to-end through the decoder.
+    #[test]
+    fn sse_decoder_oversize_line_surfaces_truncation() {
+        let mut d = SseDecoder::new(Some("req-overflow".into()));
+        // Half the budget, no newline.
+        let huge = vec![b'x'; crate::services::sse::LINE_BUDGET_BYTES / 2];
+        d.feed(&huge);
+        // One more half + 1 byte tips us over the budget.
+        let more = vec![b'x'; crate::services::sse::LINE_BUDGET_BYTES / 2 + 1];
+        d.feed(&more);
+        let err = d
+            .next_event()
+            .expect("expected truncation after overflow")
+            .expect_err("expected Err");
+        let rendered = err.to_string();
+        assert!(rendered.contains("truncated"), "got {rendered}");
+        assert!(
+            rendered.contains("LINE_BUDGET")
+                || rendered.contains("buffer exceeded")
+                || rendered.contains(&format!("{}", crate::services::sse::LINE_BUDGET_BYTES)),
+            "expected byte-count in error: {rendered}"
+        );
     }
 
     /// Regression: an adversarial server that interleaves empty `Bytes`
