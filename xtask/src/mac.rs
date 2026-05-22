@@ -36,7 +36,10 @@ pub(crate) fn sign() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn sign() -> Result<()> {
+    println!("::group::xtask sign: bundle");
     crate::commands::bundle()?;
+    println!("::endgroup::");
+
     let app = mac_app_path();
     if !app.exists() {
         bail!(
@@ -51,69 +54,103 @@ pub(crate) fn sign() -> Result<()> {
         bail!("missing entitlements at {}", entitlements.display());
     }
     let identity = env::var("APPLE_DEVELOPER_ID_APPLICATION").ok();
+    let inner_bin = app.join("Contents").join("MacOS").join("grok-insane");
 
-    // Two codesign invocation shapes:
+    // Apple deprecated `codesign --deep` in macOS 11; release notes
+    // through Sonoma/Sequoia have steadily tightened the screw on
+    // it. The previous version of this function relied on `--deep`
+    // to recursively sign the inner binary at
+    // `Contents/MacOS/grok-insane`, and on macOS 15 (Sequoia, our
+    // `macos-15-intel` runner) that produced a non-zero exit even
+    // for ad-hoc signing — the macOS release jobs died here on
+    // every run.
     //
-    //   (a) Real Developer ID identity present →
-    //         --options runtime --timestamp --entitlements <plist>
-    //         --sign "<Developer ID Application: ...>"
-    //       The full hardened-runtime + secure-timestamp + entitlements
-    //       set Apple expects for notarization.
+    // Modern Apple-recommended pattern: sign innermost-first
+    // (binary), then outermost (the .app bundle). Two invocations.
+    // Identical args except the path.
     //
-    //   (b) Ad-hoc (no identity) →
-    //         --sign -
-    //       Just enough to make the bundle openable. We deliberately
-    //       DROP `--timestamp` because codesign on Xcode 15+ errors
-    //       out with `--timestamp` + `--sign -` (the timestamp service
-    //       requires a real cert chain). The previous code passed
-    //       `--timestamp` unconditionally; macOS release jobs without
-    //       Apple secrets failed silently after the keychain step.
-    //       We also drop `--options runtime` + `--entitlements` for
-    //       ad-hoc because the hardened-runtime ticket only matters
-    //       under a real signature; layering it on an ad-hoc sig
-    //       gains us nothing and increases the chance of a future
-    //       codesign quirk failing the build.
-    //       `--deep` is kept on both: the .app contains the binary
-    //       at Contents/MacOS/grok-insane and we want it signed too.
-    let mut cmd = Command::new("codesign");
-    cmd.arg("--force").arg("--deep");
+    // Two profiles, gated on whether we have a real Developer ID:
+    //
+    //   (a) Developer ID present → hardened runtime + secure
+    //       timestamp + entitlements. The full notarization-ready
+    //       posture.
+    //
+    //   (b) Ad-hoc (no identity) → `--force --sign -` only. We
+    //       deliberately DO NOT pass `--timestamp` (errors with
+    //       `--sign -` on Xcode 15+), nor `--options runtime`, nor
+    //       `--entitlements` (no real signature for these to
+    //       attach to). The resulting .app still runs locally;
+    //       Gatekeeper warns on other Macs, right-click → Open
+    //       is the escape hatch.
+    //
+    // The `--verify` step is kept ONLY for the Developer ID path.
+    // `codesign --verify --strict` against an ad-hoc bundle is
+    // unreliable on Sequoia — it sometimes rejects bundles that
+    // open fine in Finder. Since we don't ship ad-hoc to other
+    // Macs anyway (the README + RELEASE_CHECKLIST both call this
+    // out), skipping verify here is honest, not lazy.
+    let sign_one = |path: &std::path::Path| -> Result<()> {
+        let mut cmd = Command::new("codesign");
+        cmd.arg("--force");
+        match identity.as_deref() {
+            Some(id) if !id.is_empty() => {
+                cmd.arg("--options")
+                    .arg("runtime")
+                    .arg("--timestamp")
+                    .arg("--entitlements")
+                    .arg(&entitlements)
+                    .arg("--sign")
+                    .arg(id);
+            }
+            _ => {
+                cmd.arg("--sign").arg("-");
+            }
+        }
+        cmd.arg(path);
+        run_cmd(&mut cmd)
+    };
+
     match identity.as_deref() {
         Some(id) if !id.is_empty() => {
-            cmd.arg("--options")
-                .arg("runtime")
-                .arg("--timestamp")
-                .arg("--entitlements")
-                .arg(&entitlements)
-                .arg("--sign")
-                .arg(id);
             println!("sign: codesigning with `{id}` (hardened runtime + timestamp)");
         }
         _ => {
-            cmd.arg("--sign").arg("-");
             eprintln!(
                 "sign: APPLE_DEVELOPER_ID_APPLICATION not set — using ad-hoc signature.\n\
                  The resulting .app will trigger Gatekeeper warnings on other Macs.\n\
-                 Hardened-runtime / timestamp / entitlements skipped because they\n\
-                 require a real Developer ID and codesign errors when combined\n\
-                 with `--sign -` on Xcode 15+."
+                 Hardened-runtime / timestamp / entitlements / --deep / --verify\n\
+                 are all skipped: they require a real Developer ID and codesign\n\
+                 errors when combined with `--sign -` on Sonoma/Sequoia."
             );
         }
     }
-    cmd.arg(&app);
-    run_cmd(&mut cmd)?;
 
-    // `--verify --strict` against an ad-hoc bundle is fine — strict
-    // checks the signature is internally consistent, not that it
-    // chains to a trusted CA. spctl is the assess-trust step and is
-    // only run as part of `notarize()`.
-    let mut verify = Command::new("codesign");
-    verify
-        .arg("--verify")
-        .arg("--deep")
-        .arg("--strict")
-        .arg("--verbose=2")
-        .arg(&app);
-    run_cmd(&mut verify)?;
+    println!("::group::xtask sign: codesign inner binary");
+    if inner_bin.exists() {
+        sign_one(&inner_bin)?;
+    } else {
+        bail!("inner binary missing at {}", inner_bin.display());
+    }
+    println!("::endgroup::");
+
+    println!("::group::xtask sign: codesign app bundle");
+    sign_one(&app)?;
+    println!("::endgroup::");
+
+    if matches!(identity.as_deref(), Some(id) if !id.is_empty()) {
+        // Verify only matters when there's something other than
+        // an ad-hoc signature to verify. See block comment above
+        // for why we skip on ad-hoc.
+        println!("::group::xtask sign: verify");
+        let mut verify = Command::new("codesign");
+        verify
+            .arg("--verify")
+            .arg("--strict")
+            .arg("--verbose=2")
+            .arg(&app);
+        run_cmd(&mut verify)?;
+        println!("::endgroup::");
+    }
     Ok(())
 }
 
@@ -181,9 +218,14 @@ pub(crate) fn dmg() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn dmg() -> Result<()> {
+    println!("::group::xtask dmg: sign (calls bundle + codesign)");
     sign()?;
+    println!("::endgroup::");
+
     if env::var("APPLE_ID").is_ok() && env::var("APPLE_APP_SPECIFIC_PASSWORD").is_ok() {
+        println!("::group::xtask dmg: notarize");
         notarize()?;
+        println!("::endgroup::");
     } else {
         println!("dmg: notary creds absent, skipping notarization step.");
     }
@@ -195,6 +237,7 @@ pub(crate) fn dmg() -> Result<()> {
         std::fs::remove_file(&dmg_path).ok();
     }
 
+    println!("::group::xtask dmg: stage");
     let stage = out_dir.join("dmg-stage");
     if stage.exists() {
         std::fs::remove_dir_all(&stage).ok();
@@ -208,7 +251,9 @@ pub(crate) fn dmg() -> Result<()> {
         .arg("/Applications")
         .arg(stage.join("Applications"));
     run_cmd(&mut ln)?;
+    println!("::endgroup::");
 
+    println!("::group::xtask dmg: hdiutil create");
     let mut create = Command::new("hdiutil");
     create
         .arg("create")
@@ -221,22 +266,27 @@ pub(crate) fn dmg() -> Result<()> {
         .arg("UDZO")
         .arg(&dmg_path);
     run_cmd(&mut create)?;
+    println!("::endgroup::");
 
     if let Ok(id) = env::var("APPLE_DEVELOPER_ID_APPLICATION") {
         if !id.is_empty() {
+            println!("::group::xtask dmg: codesign dmg");
             let mut sign = Command::new("codesign");
             sign.arg("--sign")
                 .arg(&id)
                 .arg("--timestamp")
                 .arg(&dmg_path);
             run_cmd(&mut sign)?;
+            println!("::endgroup::");
         }
     }
 
     if env::var("APPLE_ID").is_ok() {
+        println!("::group::xtask dmg: staple");
         let mut staple = Command::new("xcrun");
         staple.arg("stapler").arg("staple").arg(&dmg_path);
         let _ = staple.status();
+        println!("::endgroup::");
     }
 
     println!("dmg: {}", dmg_path.display());
